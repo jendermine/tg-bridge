@@ -108,6 +108,7 @@ def record_active_session(agent_override=None, title_override=None):
         agy_proc = None
         terminal = None
         emulator_proc = None
+        ancestry_pids = []
 
         curr = p
         while curr.parent():
@@ -120,9 +121,19 @@ def record_active_session(agent_override=None, title_override=None):
                     terminal = curr.terminal()
                 except Exception:
                     pass
-            elif name in ("contour", "ptyxis", "ptyxis-agent", "gnome-terminal-server", "kitty", "alacritty", "wezterm-gui"):
+
+            if agy_proc:
+                ancestry_pids.append(curr.pid)
+
+            if name in ("contour", "ptyxis", "gnome-terminal-server", "kitty", "alacritty", "wezterm-gui", "foot", "xterm"):
                 if not emulator_proc:
                     emulator_proc = curr
+            elif name == "ptyxis-agent":
+                parent = curr.parent()
+                if parent and "ptyxis" in parent.name().lower():
+                    if not emulator_proc:
+                        emulator_proc = parent
+                        ancestry_pids.append(parent.pid)
 
         if not terminal:
             curr = p
@@ -150,6 +161,7 @@ def record_active_session(agent_override=None, title_override=None):
             "terminal": terminal,
             "emulator_name": emulator_proc.name() if emulator_proc else None,
             "emulator_pid": emulator_proc.pid if emulator_proc else None,
+            "ancestry_pids": ancestry_pids,
             "cwd": cwd,
             "conv_id": conv_info.get('conv_id'),
             "title": conv_info.get('title'),

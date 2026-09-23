@@ -6,6 +6,7 @@ import json
 import urllib.request
 import urllib.parse
 import subprocess
+import re
 
 try:
     import psutil
@@ -38,27 +39,69 @@ def load_credentials():
         sys.exit(1)
     return token, user_id
 
-def send_tg_reply(token, chat_id, text, reply_to_message_id=None):
-    sender_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sender.py')
-    if not os.path.exists(sender_script):
-        sender_script = os.path.join(BASE_DIR, 'sender.py')
+def save_message_mapping(msg_id, session_data):
+    """Store Telegram message ID to session mapping for reply tracking."""
+    if not msg_id or not session_data:
+        return
+    try:
+        data = {}
+        if os.path.exists(MESSAGE_MAP_PATH):
+            try:
+                with open(MESSAGE_MAP_PATH, 'r') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
 
-    if os.path.exists(sender_script):
-        # --no-record: acks never write active_session.json or message_map.json
-        cmd = ['python3', sender_script, '--no-header', '--no-record', text]
-        subprocess.run(cmd, check=False)
-    else:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-        if reply_to_message_id:
-            payload['reply_to_message_id'] = reply_to_message_id
-        data = urllib.parse.urlencode(payload).encode()
-        req = urllib.request.Request(url, data=data)
+        data[str(msg_id)] = session_data
+
+        if len(data) > 300:
+            keys = sorted(data.keys(), key=lambda k: data[k].get('timestamp', 0))
+            for k in keys[:-300]:
+                del data[k]
+
+        os.makedirs(os.path.dirname(MESSAGE_MAP_PATH), exist_ok=True)
+        with open(MESSAGE_MAP_PATH, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not save message mapping: {e}\n")
+
+def send_tg_reply(token, chat_id, text, reply_to_message_id=None, session_data=None):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+    if reply_to_message_id:
+        payload['reply_to_message_id'] = reply_to_message_id
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(url, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            resp_data = json.loads(resp.read().decode())
+            if resp_data.get('ok') and session_data:
+                new_msg_id = resp_data.get('result', {}).get('message_id')
+                if new_msg_id:
+                    save_message_mapping(new_msg_id, session_data)
+            return resp_data
+    except urllib.error.HTTPError as e:
         try:
-            with urllib.request.urlopen(req, timeout=10):
-                pass
+            plain_text = re.sub(r'<[^>]+>', '', text)
+            payload = {'chat_id': chat_id, 'text': plain_text}
+            if reply_to_message_id:
+                payload['reply_to_message_id'] = reply_to_message_id
+            fallback_data = urllib.parse.urlencode(payload).encode()
+            fallback_req = urllib.request.Request(url, data=fallback_data)
+            with urllib.request.urlopen(fallback_req, timeout=12) as resp:
+                resp_data = json.loads(resp.read().decode())
+                if resp_data.get('ok') and session_data:
+                    new_msg_id = resp_data.get('result', {}).get('message_id')
+                    if new_msg_id:
+                        save_message_mapping(new_msg_id, session_data)
+                return resp_data
         except Exception:
             pass
+        sys.stderr.write(f"send_tg_reply HTTP error: {e}\n")
+        return None
+    except Exception as e:
+        sys.stderr.write(f"send_tg_reply error: {e}\n")
+        return None
 
 def resolve_session_from_reply(reply_msg_id):
     """Lookup originating session for the replied Telegram message ID."""
@@ -74,6 +117,31 @@ def resolve_session_from_reply(reply_msg_id):
                 proc = psutil.Process(pid)
                 cmd = " ".join(proc.cmdline()).lower()
                 if "agy" in proc.name().lower() or "agy" in cmd:
+                    # Dynamically refresh ancestry_pids and emulator_pid if missing or outdated
+                    if not session.get('ancestry_pids') or session.get('emulator_name') == 'ptyxis-agent':
+                        curr = proc
+                        pids = [proc.pid]
+                        em_name = None
+                        em_pid = None
+                        while curr.parent():
+                            curr = curr.parent()
+                            pids.append(curr.pid)
+                            pname = curr.name().lower()
+                            if pname in ('contour', 'ptyxis', 'gnome-terminal-server', 'kitty', 'alacritty', 'wezterm-gui', 'foot', 'xterm'):
+                                em_name = pname
+                                em_pid = curr.pid
+                                break
+                            elif pname == 'ptyxis-agent':
+                                parent = curr.parent()
+                                if parent and 'ptyxis' in parent.name().lower():
+                                    em_name = 'ptyxis'
+                                    em_pid = parent.pid
+                                    pids.append(parent.pid)
+                                    break
+                        session['ancestry_pids'] = pids
+                        if em_pid:
+                            session['emulator_pid'] = em_pid
+                            session['emulator_name'] = em_name
                     return session
     except Exception:
         pass
@@ -104,28 +172,36 @@ def strip_claude_prefix(message):
 def resolve_route(message):
     """Decide where an inbound message goes. agy and Claude Code never share a path.
 
-    Order: reply to a Claude message, reply to a live agy message, "/claude "
-    prefix, then the unchanged agy fallback (active_session.json, else scan).
-
-    Returns (route, session, message):
-      "claude"      queue to the Claude Code inbox (reply to a live Claude message,
-                    or a "/claude " prefixed message; prefix stripped)
-      "claude_dead" reply to an ended Claude Code session: dropped, never sent to agy
-      "claude_none" "/claude " message with no live Claude Code session: dropped
-      "agy"         legacy paste path exactly as before (session may be None)
-    Map entries without "kind" are agy.
+    Order:
+      1. Explicit reply to a message:
+         - Live Claude message -> 'claude'
+         - Dead Claude message -> 'claude_dead'
+         - Live agy message -> 'agy'
+         - Dead agy message -> 'agy_dead'
+         - Unmapped message -> 'unknown_reply'
+         (Never fallback to active_session on explicit reply)
+      2. "/claude " prefix:
+         - Live Claude session -> 'claude'
+         - No Claude session -> 'claude_none'
+      3. Unprefixed new message:
+         - Active agy session -> 'agy'
     """
     reply_to = message.get('reply_to_message')
     if reply_to:
         reply_msg_id = reply_to.get('message_id')
         mapped = lookup_mapped_session(reply_msg_id)
-        if mapped and mapped.get('kind') == 'claude':
-            if inbox.is_claude_session_alive(mapped):
-                return 'claude', mapped, message
-            return 'claude_dead', mapped, message
-        target_session = resolve_session_from_reply(reply_msg_id)
-        if target_session:
-            return 'agy', target_session, message
+        if mapped:
+            if mapped.get('kind') == 'claude':
+                if inbox.is_claude_session_alive(mapped):
+                    return 'claude', mapped, message
+                return 'claude_dead', mapped, message
+            else:
+                target_session = resolve_session_from_reply(reply_msg_id)
+                if target_session:
+                    return 'agy', target_session, message
+                return 'agy_dead', mapped, message
+        else:
+            return 'unknown_reply', None, message
 
     prefixed = strip_claude_prefix(message)
     if prefixed is not None:
@@ -189,13 +265,22 @@ def resolve_target_session():
     emulator_name = None
     emulator_pid = None
     curr = target
+    ancestry_pids = [target.pid]
     while curr.parent():
         curr = curr.parent()
+        ancestry_pids.append(curr.pid)
         pname = curr.name().lower()
-        if pname in ('contour', 'ptyxis', 'ptyxis-agent', 'gnome-terminal-server', 'kitty', 'alacritty', 'wezterm-gui'):
+        if pname in ('contour', 'ptyxis', 'gnome-terminal-server', 'kitty', 'alacritty', 'wezterm-gui', 'foot', 'xterm'):
             emulator_name = pname
             emulator_pid = curr.pid
             break
+        elif pname == 'ptyxis-agent':
+            parent = curr.parent()
+            if parent and 'ptyxis' in parent.name().lower():
+                emulator_name = 'ptyxis'
+                emulator_pid = parent.pid
+                ancestry_pids.append(parent.pid)
+                break
         if not terminal:
             try:
                 t = curr.terminal()
@@ -205,10 +290,12 @@ def resolve_target_session():
                 pass
 
     return {
+        'kind': 'agy',
         'agy_pid': target.pid,
         'terminal': terminal,
         'emulator_name': emulator_name,
         'emulator_pid': emulator_pid,
+        'ancestry_pids': ancestry_pids,
         'cwd': target.cwd() if hasattr(target, 'cwd') else None
     }
 
@@ -217,10 +304,62 @@ def inject_prompt_into_session(session=None, env=None):
     if session is None:
         session = resolve_target_session()
 
-    emulator_pid = session.get('emulator_pid') if session else None
-    emulator_name = session.get('emulator_name') if session else None
+    ydotool_env = os.environ.copy()
+    if env:
+        ydotool_env.update(env)
+    ydotool_env['YDOTOOL_SOCKET'] = '/tmp/.ydotool_socket'
 
-    # 1. Activate/Focus the target emulator window
+    # 1. Check and wake display if in power saving mode (DPMS)
+    try:
+        res = subprocess.run([
+            'gdbus', 'call', '--session',
+            '--dest', 'org.gnome.Mutter.DisplayConfig',
+            '--object-path', '/org/gnome/Mutter/DisplayConfig',
+            '--method', 'org.freedesktop.DBus.Properties.Get',
+            'org.gnome.Mutter.DisplayConfig',
+            'PowerSaveMode'
+        ], env=env, capture_output=True, text=True, check=False)
+        # PowerSaveMode: 0=On, 1=Standby, 2=Suspend, 3=Off
+        if '<0>' not in res.stdout and '(<0>,)' not in res.stdout:
+            subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'org.gnome.Mutter.DisplayConfig',
+                '--object-path', '/org/gnome/Mutter/DisplayConfig',
+                '--method', 'org.freedesktop.DBus.Properties.Set',
+                'org.gnome.Mutter.DisplayConfig',
+                'PowerSaveMode',
+                '<0>'
+            ], env=env, capture_output=True, check=False)
+            subprocess.run(['ydotool', 'key', '-d', '10', '42:1', '42:0'], env=ydotool_env, capture_output=True, check=False)
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+    # 2. Activate/Focus the target emulator window via GNOME Shell / clipman
+    pids_to_try = []
+    if session:
+        if session.get('emulator_pid'):
+            pids_to_try.append(session['emulator_pid'])
+        if session.get('ancestry_pids'):
+            for p in reversed(session['ancestry_pids']):
+                if p not in pids_to_try:
+                    pids_to_try.append(p)
+        if session.get('agy_pid') and session['agy_pid'] not in pids_to_try:
+            pids_to_try.append(session['agy_pid'])
+
+    for pid in pids_to_try:
+        try:
+            subprocess.run([
+                'gdbus', 'call', '--session',
+                '--dest', 'com.clipman.Daemon',
+                '--object-path', '/com/clipman/Daemon',
+                '--method', 'com.clipman.Daemon.ActivateWindowByPid',
+                str(pid)
+            ], env=env, capture_output=True, check=False)
+        except Exception:
+            pass
+
+    emulator_name = session.get('emulator_name') if session else None
     if emulator_name in ('ptyxis', 'ptyxis-agent'):
         subprocess.run([
             'gdbus', 'call', '--session',
@@ -231,9 +370,26 @@ def inject_prompt_into_session(session=None, env=None):
         ], env=env, capture_output=True, check=False)
 
     # Allow Wayland window focus to settle
-    time.sleep(0.12)
+    time.sleep(0.25)
 
-    # 2. Simulate Paste (Ctrl+Shift+V)
+    # 3. Check if screen is locked
+    screen_locked = False
+    try:
+        res = subprocess.run([
+            'gdbus', 'call', '--session',
+            '--dest', 'org.gnome.ScreenSaver',
+            '--object-path', '/org/gnome/ScreenSaver',
+            '--method', 'org.gnome.ScreenSaver.GetActive'
+        ], env=env, capture_output=True, text=True, check=False)
+        if '(true,)' in res.stdout:
+            screen_locked = True
+    except Exception:
+        pass
+
+    if screen_locked:
+        return session, "locked"
+
+    # 4. Simulate Paste (Ctrl+Shift+V)
     pasted = False
     try:
         res = subprocess.run([
@@ -248,11 +404,6 @@ def inject_prompt_into_session(session=None, env=None):
     except Exception:
         pass
 
-    ydotool_env = os.environ.copy()
-    if env:
-        ydotool_env.update(env)
-    ydotool_env['YDOTOOL_SOCKET'] = '/tmp/.ydotool_socket'
-
     if not pasted:
         # Fallback paste via ydotool (Ctrl+Shift+V): KEY_LEFTCTRL(29), KEY_LEFTSHIFT(42), KEY_V(47)
         subprocess.run(
@@ -261,15 +412,15 @@ def inject_prompt_into_session(session=None, env=None):
         )
 
     # Wait for the terminal to absorb the paste buffer
-    time.sleep(0.15)
+    time.sleep(0.18)
 
-    # 3. Simulate Enter (KEY_ENTER 28) to SUBMIT the prompt
+    # 5. Simulate Enter (KEY_ENTER 28) to SUBMIT the prompt
     subprocess.run(
         ['ydotool', 'key', '-d', '15', '28:1', '28:0'],
         env=ydotool_env, capture_output=True, check=False
     )
 
-    return session
+    return session, "submitted"
 
 def download_file(token, file_id, dest_folder):
     os.makedirs(dest_folder, exist_ok=True)
@@ -371,6 +522,27 @@ def process_update(update, token, env):
 
     route, target_session, message = resolve_route(message)
 
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Update {update.get('update_id')}: route={route}, target_pid={target_session.get('agy_pid') or target_session.get('claude_pid') if target_session else None}")
+    sys.stdout.flush()
+
+    if route == 'unknown_reply':
+        subprocess.run(['notify-send', 'Telegram reply dropped',
+                        'Unknown target session for reply', '-a', 'tg-bridge'], env=env, check=False)
+        send_tg_reply(token, from_id,
+                      "Could not determine target session for replied message. Please reply to an active session message, or use /claude.",
+                      reply_to_message_id=message_id)
+        return route
+
+    if route == 'agy_dead':
+        pid = target_session.get('agy_pid') if target_session else None
+        title = target_session.get('title') if target_session else "Target"
+        subprocess.run(['notify-send', 'Telegram reply dropped',
+                        f"Session '{title}' has ended", '-a', 'tg-bridge'], env=env, check=False)
+        send_tg_reply(token, from_id,
+                      f"Antigravity session '{title}' (PID {pid}) is no longer running. Message not delivered.",
+                      reply_to_message_id=message_id)
+        return route
+
     if route == 'claude_none':
         subprocess.run(['notify-send', 'Telegram /claude message dropped',
                         'No live Claude Code session', '-a', 'tg-bridge'], env=env, check=False)
@@ -400,7 +572,7 @@ def process_update(update, token, env):
             '-a', 'tg-bridge'
         ], env=env, check=False)
         send_tg_reply(token, from_id, f"Queued for {claude_label(target_session)}",
-                      reply_to_message_id=message_id)
+                      reply_to_message_id=message_id, session_data=target_session)
         return route
 
     if route == 'claude_dead':
@@ -411,18 +583,21 @@ def process_update(update, token, env):
                       reply_to_message_id=message_id)
         return route
 
-    # agy path: unchanged behaviour
+    # agy path: inject into target terminal session
     stage_clipboard(payload['staged'], env)
     notify_received(payload, env)
 
-    session = inject_prompt_into_session(session=target_session, env=env)
+    session, status = inject_prompt_into_session(session=target_session, env=env)
     session_info = ""
     if session and session.get('agy_pid'):
         agent_lbl = session.get('agent', 'Antigravity')
         title_lbl = session.get('title', '')
         term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
         target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
-        session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
+        if status == "locked":
+            session_info = f"\n[Display is locked. Input staged in clipboard; unlock screen to submit to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
+        else:
+            session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
     else:
         session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
 
@@ -430,7 +605,8 @@ def process_update(update, token, env):
         token,
         from_id,
         f'{ack_prefix(payload)}{session_info}',
-        reply_to_message_id=message_id
+        reply_to_message_id=message_id,
+        session_data=session or target_session
     )
     return route
 
