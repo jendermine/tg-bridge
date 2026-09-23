@@ -12,6 +12,9 @@ try:
 except ImportError:
     psutil = None
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import inbox
+
 CRED_PATH = os.path.expanduser('~/Documents/tg.txt')
 BASE_DIR = os.path.expanduser('~/.local/share/tg-bridge')
 IMAGES_DIR = os.path.join(BASE_DIR, 'images')
@@ -41,7 +44,8 @@ def send_tg_reply(token, chat_id, text, reply_to_message_id=None):
         sender_script = os.path.join(BASE_DIR, 'sender.py')
 
     if os.path.exists(sender_script):
-        cmd = ['python3', sender_script, '--no-header', text]
+        # --no-record: acks never write active_session.json or message_map.json
+        cmd = ['python3', sender_script, '--no-header', '--no-record', text]
         subprocess.run(cmd, check=False)
     else:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -74,6 +78,61 @@ def resolve_session_from_reply(reply_msg_id):
     except Exception:
         pass
     return None
+
+def lookup_mapped_session(reply_msg_id):
+    """Raw message_map.json entry for a Telegram message ID, or None."""
+    if not os.path.exists(MESSAGE_MAP_PATH):
+        return None
+    try:
+        with open(MESSAGE_MAP_PATH, 'r') as f:
+            return json.load(f).get(str(reply_msg_id))
+    except Exception:
+        return None
+
+CLAUDE_PREFIX = '/claude '
+
+def strip_claude_prefix(message):
+    """If the text (or caption) starts with "/claude ", return a copy without it, else None."""
+    for key in ('text', 'caption'):
+        value = message.get(key)
+        if isinstance(value, str) and value.startswith(CLAUDE_PREFIX):
+            stripped = dict(message)
+            stripped[key] = value[len(CLAUDE_PREFIX):]
+            return stripped
+    return None
+
+def resolve_route(message):
+    """Decide where an inbound message goes. agy and Claude Code never share a path.
+
+    Order: reply to a Claude message, reply to a live agy message, "/claude "
+    prefix, then the unchanged agy fallback (active_session.json, else scan).
+
+    Returns (route, session, message):
+      "claude"      queue to the Claude Code inbox (reply to a live Claude message,
+                    or a "/claude " prefixed message; prefix stripped)
+      "claude_dead" reply to an ended Claude Code session: dropped, never sent to agy
+      "claude_none" "/claude " message with no live Claude Code session: dropped
+      "agy"         legacy paste path exactly as before (session may be None)
+    Map entries without "kind" are agy.
+    """
+    reply_to = message.get('reply_to_message')
+    if reply_to:
+        reply_msg_id = reply_to.get('message_id')
+        mapped = lookup_mapped_session(reply_msg_id)
+        if mapped and mapped.get('kind') == 'claude':
+            if inbox.is_claude_session_alive(mapped):
+                return 'claude', mapped, message
+            return 'claude_dead', mapped, message
+        target_session = resolve_session_from_reply(reply_msg_id)
+        if target_session:
+            return 'agy', target_session, message
+
+    prefixed = strip_claude_prefix(message)
+    if prefixed is not None:
+        session = inbox.latest_live_claude_session()
+        return ('claude' if session else 'claude_none'), session, prefixed
+
+    return 'agy', resolve_target_session(), message
 
 def resolve_target_session():
     """Identify the active agy session communicating with tg-bridge or active on system."""
@@ -234,6 +293,147 @@ def download_file(token, file_id, dest_folder):
         sys.stderr.write(f"Error downloading file {file_id}: {e}\n")
         return None
 
+def extract_payload(token, message):
+    """Normalise a Telegram message into a payload dict, downloading images.
+
+    Returns None for unsupported messages or failed downloads (ignored, as before).
+    """
+    if 'photo' in message:
+        file_id = message['photo'][-1]['file_id']
+        payload_type = 'photo'
+    elif 'document' in message and message['document'].get('mime_type', '').startswith('image/'):
+        file_id = message['document']['file_id']
+        payload_type = 'document'
+    elif 'text' in message:
+        text = message['text']
+        return {'type': 'text', 'text': text, 'caption': None, 'image_path': None, 'staged': text}
+    else:
+        return None
+
+    caption = message.get('caption', '').strip()
+    local_img_path = download_file(token, file_id, IMAGES_DIR)
+    if not local_img_path:
+        return None
+    staged_text = f"{caption} [Image: {local_img_path}]".strip() if caption else local_img_path
+    return {'type': payload_type, 'text': caption, 'caption': caption or None,
+            'image_path': local_img_path, 'staged': staged_text}
+
+def stage_clipboard(text, env):
+    subprocess.run(['wl-copy', text], input=text.encode(), env=env, check=False)
+    subprocess.run(['wl-copy', '--primary', text], input=text.encode(), env=env, check=False)
+
+def notify_received(payload, env):
+    if payload['type'] == 'photo':
+        notify_body = f"Saved: {os.path.basename(payload['image_path'])}"
+        if payload['caption']:
+            notify_body += f"\nCaption: {payload['caption']}"
+        subprocess.run([
+            'notify-send',
+            '-i', payload['image_path'],
+            'Telegram Image Received',
+            notify_body,
+            '-a', 'tg-bridge'
+        ], env=env, check=False)
+    elif payload['type'] == 'document':
+        subprocess.run([
+            'notify-send',
+            '-i', payload['image_path'],
+            'Telegram Image Document',
+            f"Saved: {os.path.basename(payload['image_path'])}",
+            '-a', 'tg-bridge'
+        ], env=env, check=False)
+    else:
+        subprocess.run([
+            'notify-send',
+            'Telegram Prompt Received',
+            f"Staged in clipboard: {payload['text'][:60]}",
+            '-a', 'tg-bridge'
+        ], env=env, check=False)
+
+def ack_prefix(payload):
+    if payload['type'] == 'photo':
+        return f"Image received and saved to: <code>{payload['image_path']}</code>"
+    if payload['type'] == 'document':
+        return f"Image document received and saved to: <code>{payload['image_path']}</code>"
+    return f'Received: "<i>{payload["text"]}</i>"'
+
+def claude_label(session):
+    agent_lbl = session.get('agent') or 'Claude Code'
+    title_lbl = session.get('title', '')
+    target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
+    return f"{target_desc} (PID {session.get('claude_pid')})"
+
+def process_update(update, token, env):
+    """Route one authorized Telegram update to agy (paste) or Claude Code (inbox)."""
+    message = update.get('message', {})
+    from_id = message.get('from', {}).get('id')
+    message_id = message.get('message_id')
+
+    route, target_session, message = resolve_route(message)
+
+    if route == 'claude_none':
+        subprocess.run(['notify-send', 'Telegram /claude message dropped',
+                        'No live Claude Code session', '-a', 'tg-bridge'], env=env, check=False)
+        send_tg_reply(token, from_id, "No live Claude Code session. Message not delivered.",
+                      reply_to_message_id=message_id)
+        return route
+
+    payload = extract_payload(token, message)
+    if not payload:
+        return None
+
+    # Claude Code paths: never touch the clipboard, window focus, paste or ydotool.
+    if route == 'claude':
+        entry = {
+            'update_id': update.get('update_id'),
+            'message_id': message_id,
+            'date': message.get('date'),
+            'text': payload['text'],
+            'image_path': payload['image_path'],
+            'caption': payload['caption'],
+        }
+        inbox.append_inbox(target_session['claude_pid'], entry)
+        subprocess.run([
+            'notify-send',
+            'Telegram message queued',
+            f"For {claude_label(target_session)}: {(payload['text'] or payload['image_path'] or '')[:60]}",
+            '-a', 'tg-bridge'
+        ], env=env, check=False)
+        send_tg_reply(token, from_id, f"Queued for {claude_label(target_session)}",
+                      reply_to_message_id=message_id)
+        return route
+
+    if route == 'claude_dead':
+        subprocess.run(['notify-send', 'Telegram reply dropped',
+                        f"{claude_label(target_session)} has ended", '-a', 'tg-bridge'], env=env, check=False)
+        send_tg_reply(token, from_id,
+                      f"{claude_label(target_session)} has ended. Message not delivered.",
+                      reply_to_message_id=message_id)
+        return route
+
+    # agy path: unchanged behaviour
+    stage_clipboard(payload['staged'], env)
+    notify_received(payload, env)
+
+    session = inject_prompt_into_session(session=target_session, env=env)
+    session_info = ""
+    if session and session.get('agy_pid'):
+        agent_lbl = session.get('agent', 'Antigravity')
+        title_lbl = session.get('title', '')
+        term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
+        target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
+        session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
+    else:
+        session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
+
+    send_tg_reply(
+        token,
+        from_id,
+        f'{ack_prefix(payload)}{session_info}',
+        reply_to_message_id=message_id
+    )
+    return route
+
 def main():
     token, authorized_id = load_credentials()
     os.makedirs(IMAGES_DIR, exist_ok=True)
@@ -267,134 +467,11 @@ def main():
             if data.get('ok'):
                 for update in data.get('result', []):
                     offset = update['update_id'] + 1
-                    message = update.get('message', {})
-                    from_id = message.get('from', {}).get('id')
-                    message_id = message.get('message_id')
-
+                    from_id = update.get('message', {}).get('from', {}).get('id')
                     if from_id != authorized_id:
                         continue
 
-                    # Check if this update is a reply to a previous message
-                    reply_to = message.get('reply_to_message')
-                    target_session = None
-
-                    if reply_to:
-                        reply_msg_id = reply_to.get('message_id')
-                        target_session = resolve_session_from_reply(reply_msg_id)
-
-                    if not target_session:
-                        target_session = resolve_target_session()
-
-                    # 1. Photo
-                    if 'photo' in message:
-                        photo_list = message['photo']
-                        largest_photo = photo_list[-1]
-                        file_id = largest_photo['file_id']
-                        caption = message.get('caption', '').strip()
-
-                        local_img_path = download_file(token, file_id, IMAGES_DIR)
-                        if local_img_path:
-                            staged_text = f"{caption} [Image: {local_img_path}]".strip() if caption else local_img_path
-                            subprocess.run(['wl-copy', staged_text], input=staged_text.encode(), env=env, check=False)
-                            subprocess.run(['wl-copy', '--primary', staged_text], input=staged_text.encode(), env=env, check=False)
-
-                            notify_body = f"Saved: {os.path.basename(local_img_path)}"
-                            if caption:
-                                notify_body += f"\nCaption: {caption}"
-                            subprocess.run([
-                                'notify-send',
-                                '-i', local_img_path,
-                                'Telegram Image Received',
-                                notify_body,
-                                '-a', 'tg-bridge'
-                            ], env=env, check=False)
-
-                            session = inject_prompt_into_session(session=target_session, env=env)
-                            session_info = ""
-                            if session and session.get('agy_pid'):
-                                agent_lbl = session.get('agent', 'Antigravity')
-                                title_lbl = session.get('title', '')
-                                term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
-                                target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
-                                session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
-                            else:
-                                session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
-
-                            send_tg_reply(
-                                token,
-                                from_id,
-                                f'Image received and saved to: <code>{local_img_path}</code>{session_info}',
-                                reply_to_message_id=message_id
-                            )
-
-                    # 2. Document (Image)
-                    elif 'document' in message and message['document'].get('mime_type', '').startswith('image/'):
-                        doc = message['document']
-                        file_id = doc['file_id']
-                        caption = message.get('caption', '').strip()
-
-                        local_img_path = download_file(token, file_id, IMAGES_DIR)
-                        if local_img_path:
-                            staged_text = f"{caption} [Image: {local_img_path}]".strip() if caption else local_img_path
-                            subprocess.run(['wl-copy', staged_text], input=staged_text.encode(), env=env, check=False)
-                            subprocess.run(['wl-copy', '--primary', staged_text], input=staged_text.encode(), env=env, check=False)
-
-                            subprocess.run([
-                                'notify-send',
-                                '-i', local_img_path,
-                                'Telegram Image Document',
-                                f"Saved: {os.path.basename(local_img_path)}",
-                                '-a', 'tg-bridge'
-                            ], env=env, check=False)
-
-                            session = inject_prompt_into_session(session=target_session, env=env)
-                            session_info = ""
-                            if session and session.get('agy_pid'):
-                                agent_lbl = session.get('agent', 'Antigravity')
-                                title_lbl = session.get('title', '')
-                                term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
-                                target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
-                                session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
-                            else:
-                                session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
-
-                            send_tg_reply(
-                                token,
-                                from_id,
-                                f'Image document received and saved to: <code>{local_img_path}</code>{session_info}',
-                                reply_to_message_id=message_id
-                            )
-
-                    # 3. Plain Text
-                    elif 'text' in message:
-                        text = message['text']
-                        subprocess.run(['wl-copy', text], input=text.encode(), env=env, check=False)
-                        subprocess.run(['wl-copy', '--primary', text], input=text.encode(), env=env, check=False)
-
-                        subprocess.run([
-                            'notify-send',
-                            'Telegram Prompt Received',
-                            f'Staged in clipboard: {text[:60]}',
-                            '-a', 'tg-bridge'
-                        ], env=env, check=False)
-
-                        session = inject_prompt_into_session(session=target_session, env=env)
-                        session_info = ""
-                        if session and session.get('agy_pid'):
-                            agent_lbl = session.get('agent', 'Antigravity')
-                            title_lbl = session.get('title', '')
-                            term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
-                            target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
-                            session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
-                        else:
-                            session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
-
-                        send_tg_reply(
-                            token,
-                            from_id,
-                            f'Received: "<i>{text}</i>"{session_info}',
-                            reply_to_message_id=message_id
-                        )
+                    process_update(update, token, env)
 
         except Exception as e:
             sys.stderr.write(f"Polling error: {e}\n")

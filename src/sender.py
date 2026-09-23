@@ -16,6 +16,9 @@ try:
 except ImportError:
     psutil = None
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import inbox
+
 CRED_PATH = os.path.expanduser('~/Documents/tg.txt')
 BASE_DIR = os.path.expanduser('~/.local/share/tg-bridge')
 SESSION_PATH = os.path.join(BASE_DIR, 'active_session.json')
@@ -82,9 +85,23 @@ def get_agy_conv_info(pid, cwd=None):
     return {'conv_id': conv_id, 'title': title, 'agent': agent}
 
 def record_active_session(agent_override=None, title_override=None):
-    """Identify the agy session running this command and save to active_session.json."""
+    """Identify the agent session running this command and record it.
+
+    agy sessions go to active_session.json (agy-only). Claude Code sessions go
+    to active_session_claude.json and never touch the agy state.
+    """
     if not psutil:
         return {}
+
+    claude_proc = inbox.find_claude_ancestor()
+    if claude_proc:
+        try:
+            session_data = inbox.claude_session_data(claude_proc, agent_override, title_override)
+            inbox.record_claude_session(session_data)
+            return session_data
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not record Claude Code session: {e}\n")
+            return {}
 
     try:
         p = psutil.Process(os.getpid())
@@ -128,6 +145,7 @@ def record_active_session(agent_override=None, title_override=None):
             conv_info['title'] = title_override
 
         session_data = {
+            "kind": "agy",
             "agy_pid": agy_proc.pid if agy_proc else None,
             "terminal": terminal,
             "emulator_name": emulator_proc.name() if emulator_proc else None,
@@ -280,11 +298,16 @@ def main():
     parser.add_argument('--agent', default=None, help="Agent name override")
     parser.add_argument('--title', default=None, help="Conversation title override")
     parser.add_argument('--no-header', action='store_true', help="Do not include agent/conversation header")
+    parser.add_argument('--no-record', action='store_true',
+                        help="Do not write active session or message map (used for listener acks)")
     parser.add_argument('content', nargs='*', help="Message text or image file path")
 
     args = parser.parse_args()
 
-    session_data = record_active_session(agent_override=args.agent, title_override=args.title)
+    if args.no_record:
+        session_data = {}
+    else:
+        session_data = record_active_session(agent_override=args.agent, title_override=args.title)
 
     agent_name = session_data.get('agent', 'Antigravity')
     conv_title = session_data.get('title', 'Session')

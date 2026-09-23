@@ -21,6 +21,7 @@ elif [ -f "${HOME}/.local/share/tg-bridge/sender.py" ]; then
 else
     SENDER="${SCRIPT_DIR}/sender.py"
 fi
+INBOX="$( dirname "$SENDER" )/inbox.py"
 
 case "$1" in
     start)
@@ -53,8 +54,16 @@ case "$1" in
         python3 "$SENDER" "$@"
         ;;
 
+    inbox)
+        shift
+        # Exit codes: 0 ok, 2 not in a Claude Code session, 3 --wait timed out
+        set +e
+        python3 "$INBOX" "$@"
+        exit $?
+        ;;
+
     *)
-        echo "Usage: tg-bridge {start|stop|restart|status|logs|send <message/path>}"
+        echo "Usage: tg-bridge {start|stop|restart|status|logs|send <message/path>|inbox [--wait [SECONDS]] [--peek]}"
         exit 1
         ;;
 esac

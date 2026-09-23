@@ -103,7 +103,34 @@ cat report.md | tg-bridge send
 # Explicit agent or title overrides
 tg-bridge send --agent "Database Refactorer" --title "Schema Migration" "Migration completed."
 tg-bridge send --no-header "Raw message without header tag"
+tg-bridge send --no-record "Send without recording a session or message mapping"
+
+# Claude Code sessions only
+tg-bridge inbox                 # print queued replies for this session and mark them read
+tg-bridge inbox --peek          # print without marking read
+tg-bridge inbox --wait [SECONDS] # block until a reply arrives (default 1800s, exit 3 on timeout)
 ```
+
+---
+
+## Claude Code Sessions
+
+Claude Code runs as a `claude` process spawned by the Claude desktop app, with no terminal or window to paste into. tg-bridge detects it by walking the caller's process tree and handles it through a separate inbox instead of input injection.
+
+- Send: `tg-bridge send "<message>"` from a Claude Code tool shell. The header reads `[Agent: Claude Code | <cwd basename or --title>]`.
+- Receive: reply on Telegram to that message. The listener appends it to `~/.local/share/tg-bridge/inbox/claude-<pid>.jsonl` and acks `Queued for Claude Code | <title> (PID n)`.
+- Read: `tg-bridge inbox` prints `[tg <message_id>] <text> [Image: <path>]` lines and moves them to `claude-<pid>.done.jsonl`. `--peek` leaves them unread. `--wait [SECONDS]` blocks until at least one message exists (polls every 2s, default 1800s, exit 3 on timeout).
+- Exit codes: 0 ok, 2 not called from a Claude Code session, 3 `--wait` timed out.
+- Fresh message to Claude: start it with `/claude ` (the prefix is stripped). It goes to the most recently active live Claude Code session.
+
+### Separation rules (agy and Claude Code never interfere)
+
+- `active_session.json` is agy-only. Claude Code sessions are recorded in `active_session_claude.json`. `message_map.json` entries carry `"kind": "agy"` or `"kind": "claude"`; entries without `kind` are agy.
+- Fresh (non-reply) messages always follow the agy behaviour (active agy session, else newest agy process), even if Claude Code sent last. Only `/claude ` messages go to Claude Code; if no Claude Code session is alive the message is acked as not delivered and nothing else happens.
+- Replies to an agy message go to agy exactly as before.
+- Replies to a Claude Code message go to that session's inbox. If that session has ended, the reply is acked as not delivered and is never sent to agy.
+- Claude Code routing never touches agy's input path: no clipboard (`wl-copy`), no window focus, no paste, no `ydotool`. Only `notify-send` is used.
+- Listener acks call `sender.py --no-record`, so they never write `active_session.json` or `message_map.json`.
 
 ---
 

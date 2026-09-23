@@ -27,7 +27,9 @@ flowchart TD
         subgraph LocalState["State & Storage (~/.local/share/tg-bridge/)"]
             Creds["~/Documents/tg.txt (Token & User ID)"]
             ActiveSession["active_session.json (PID, PTS, Emulator)"]
-            MessageMap["message_map.json (Message ID to Session Map)"]
+            MessageMap["message_map.json (Message ID to Session Map, kind agy/claude)"]
+            ClaudeSessions["active_session_claude.json (Claude Code sessions)"]
+            InboxDir["inbox/claude-PID.jsonl (queued replies)"]
             ImagesDir["images/ (Downloaded Media)"]
         end
 
@@ -204,7 +206,28 @@ flowchart TD
 
 ---
 
-## 5. Wayland Virtual Input & Window Focusing
+## 5. Claude Code Routing (inbox, no input injection)
+
+Claude Code runs as a `claude` process (`~/.config/Claude/claude-code/<ver>/claude`) spawned by the Claude desktop app. It has no terminal or targetable window, so tg-bridge never pastes into it. agy and Claude Code are kept fully separate.
+
+Outbound (`sender.py`):
+- Walks the caller's ancestors. If a process named `claude` (or whose argv[0] contains `/claude-code/`) is found before any process named `agy`, the session is `{kind: "claude", claude_pid, claude_create_time, cwd, agent: "Claude Code", title, timestamp}`.
+- Claude sessions are upserted into `active_session_claude.json` (keyed by pid, newest 20). `active_session.json` stays agy-only and agy sessions are recorded with `kind: "agy"`.
+- Every sent message ID is mapped to its session in `message_map.json`. `--no-record` skips both writes; the listener uses it for all acks.
+
+Inbound (`listener.py`, `resolve_route`), in order:
+1. Reply to a `kind: "claude"` message: if the pid is alive and still the same `claude` process (create time matches), append `{update_id, message_id, date, text, image_path, caption}` to `inbox/claude-<pid>.jsonl` under a lock and ack `Queued for Claude Code | <title> (PID n)`. If it has ended, ack that the message was not delivered. Never falls back to agy.
+2. Reply to an agy message (or a legacy entry without `kind`) whose agy pid is alive: agy paste path, unchanged.
+3. Text or caption starting with `/claude `: prefix stripped, queued to the most recent live session in `active_session_claude.json`; if none is alive, ack and drop.
+4. Anything else: unchanged agy path (active_session.json, else newest agy process, else clipboard only).
+
+Claude routes use only `notify-send`: no `wl-copy`, no window focus, no paste, no `ydotool`.
+
+Reading (`inbox.py`, `tg-bridge inbox`): resolves the caller's `claude_pid` the same way, prints `[tg <message_id>] <text> [Image: <path>]` lines, and under the same lock moves consumed lines to `claude-<pid>.done.jsonl`. `--peek` does not consume; `--wait [SECONDS]` polls every 2s (default 1800s) and exits 3 on timeout; exit 2 outside Claude Code.
+
+---
+
+## 6. Wayland Virtual Input & Window Focusing
 
 GNOME Mutter on Wayland restricts arbitrary synthetic keypresses and window focus stealing for security. tg-bridge bypasses this reliably without requiring root privileges during operation:
 

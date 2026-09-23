@@ -10,7 +10,7 @@ SYSTEMD_DIR="${HOME}/.config/systemd/user"
 echo "==> Installing tg-bridge..."
 
 # 1. Ensure target directories exist
-mkdir -p "$BIN_DIR" "$SHARE_DIR" "$SHARE_DIR/images" "$SYSTEMD_DIR"
+mkdir -p "$BIN_DIR" "$SHARE_DIR" "$SHARE_DIR/images" "$SHARE_DIR/inbox" "$SYSTEMD_DIR"
 
 # 2. Deploy binary controller
 echo "==> Linking CLI binary to $BIN_DIR/tg-bridge"
@@ -21,7 +21,8 @@ chmod +x "$BIN_DIR/tg-bridge"
 echo "==> Linking daemon scripts to $SHARE_DIR"
 ln -sf "$SCRIPT_DIR/src/listener.py" "$SHARE_DIR/listener.py"
 ln -sf "$SCRIPT_DIR/src/sender.py" "$SHARE_DIR/sender.py"
-chmod +x "$SHARE_DIR/listener.py" "$SHARE_DIR/sender.py"
+ln -sf "$SCRIPT_DIR/src/inbox.py" "$SHARE_DIR/inbox.py"
+chmod +x "$SHARE_DIR/listener.py" "$SHARE_DIR/sender.py" "$SHARE_DIR/inbox.py"
 
 # 4. Deploy systemd unit
 echo "==> Installing systemd user unit to $SYSTEMD_DIR/tg-bridge.service"
@@ -45,3 +46,4 @@ echo "  tg-bridge start    # Start the background bridge daemon"
 echo "  tg-bridge status   # Check daemon status"
 echo "  tg-bridge logs     # View live journal logs"
 echo "  tg-bridge send     # Send message or image to Telegram"
+echo "  tg-bridge inbox    # Read Telegram replies queued for this Claude Code session"
