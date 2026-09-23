@@ -1,38 +1,41 @@
-# 🛰️ tg-bridge: Antigravity Telegram Bridge
+# tg-bridge: Antigravity Telegram Bridge
 
-An intelligent, headless bridge linking **Telegram** directly to your active **Google Antigravity (`agy`)** CLI coding session on Linux (Wayland / GNOME).
+A headless bridge linking Telegram directly to active Google Antigravity (agy) CLI coding sessions on Linux (Wayland / GNOME).
 
-Send prompts, code snippets, and image attachments from your phone via Telegram. `tg-bridge` automatically identifies your active `agy` terminal session, brings the window to focus, pastes the input (`Ctrl+Shift+V`), and presses `Enter` to submit the turn automatically.
+Send prompts, code snippets, and image attachments from Telegram. The bridge automatically identifies the target session, brings the terminal window to focus, pastes the input (Ctrl+Shift+V), and presses Enter to submit the turn automatically.
 
----
-
-## ✨ Features
-
-- **Automated Session Discovery**: Tracks which `agy` session is actively talking. When multiple terminal windows exist, it targets the one currently communicating with Telegram or the active session.
-- **Wayland Window Focus & Input Injection**: Natively raises the target terminal window on GNOME Wayland and simulates `Ctrl+Shift+V` followed by `KEY_ENTER` without requiring manual intervention.
-- **Image & Screenshot Support**: Photos and image documents sent via Telegram are downloaded to `~/.local/share/tg-bridge/images/` and automatically formatted as `[Image: /path/to/image]` in the input prompt.
-- **Rich Outbound Formatting**: `tg-bridge send` automatically translates Markdown (headers, bold, italics, code blocks) into Telegram-compliant HTML and splits oversized outputs into clean chunks.
-- **Desktop Notifications**: Provides immediate desktop feedback using `notify-send` with thumbnail previews.
+When running multiple agents across different workspaces or terminals, replying directly to an agent's message on Telegram routes your response exclusively to that specific agent session.
 
 ---
 
-## 📐 Architecture Overview
+## Features
+
+- Multi-Agent Routing: Every outbound message tags the originating agent name and conversation title, recording the Telegram message ID. Replying to a message on Telegram routes your prompt directly to that specific agent session.
+- Automated Session Discovery: Dynamically tracks which agy session is actively communicating. Falls back to the most recently active session when messages are not replies.
+- Wayland Window Focus and Input Injection: Natively raises the target terminal window on GNOME Wayland and simulates Ctrl+Shift+V followed by KEY_ENTER via kernel uinput (ydotool).
+- Image and Screenshot Support: Photos and image documents sent via Telegram are downloaded to ~/.local/share/tg-bridge/images/ and automatically formatted as [Image: /path/to/image] in the input prompt.
+- Rich Outbound Formatting: Translates Markdown (headers, bold, italics, code blocks) into Telegram HTML and splits oversized outputs into chunks.
+- Desktop Notifications: Provides immediate desktop feedback using notify-send with thumbnail previews.
+
+---
+
+## Architecture Overview
 
 ```mermaid
 flowchart LR
     subgraph Telegram["Telegram"]
-        Phone["📱 Telegram App"]
-        Bot["🤖 Telegram Bot API"]
+        Phone["Telegram App"]
+        Bot["Telegram Bot API"]
         Phone <--> Bot
     end
 
     subgraph System["Local Workstation"]
-        Listener["🎧 listener.py (Daemon)"]
-        Sender["📤 sender.py (CLI)"]
-        YDoTool["⌨️ ydotool (uinput)"]
-        Agy["🚀 agy (Antigravity CLI)"]
+        Listener["listener.py (Daemon)"]
+        Sender["sender.py (CLI)"]
+        YDoTool["ydotool (uinput)"]
+        Agy["agy (Antigravity CLI)"]
 
-        Bot -->|getUpdates| Listener
+        Bot -->|getUpdates / replies| Listener
         Listener -->|Focus + Paste + Enter| Agy
         Agy -->|tg-bridge send| Sender
         Sender -->|sendMessage / sendPhoto| Bot
@@ -40,20 +43,20 @@ flowchart LR
     end
 ```
 
-For complete sequence diagrams and internal design, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For complete sequence diagrams, reply-routing flows, and internal design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Requirements
 - Linux (Fedora / Ubuntu / Arch with GNOME Wayland or X11)
-- Python 3.9+ with `psutil`
-- `wl-clipboard` (`wl-copy`)
-- `ydotool` (configured with systemd service)
+- Python 3.9+ with psutil
+- wl-clipboard (wl-copy)
+- ydotool (configured with systemd service and uinput access)
 
 ### 2. Setup Credentials
-Create `~/Documents/tg.txt` containing your Telegram Bot Token on line 1 and your authorized user ID on line 2:
+Create ~/Documents/tg.txt containing your Telegram Bot Token on line 1 and your authorized user ID on line 2:
 ```text
 1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
 id: 987654321
@@ -67,16 +70,22 @@ cd ~/projects/tg-bridge
 ./install.sh
 ```
 
-### 4. Start the Service
+### 4. Setup Input Injection Permissions
+Run the uinput setup script once to grant ydotool permissions:
+```bash
+./integrations/setup-uinput.sh
+```
+
+### 5. Start the Service
 ```bash
 tg-bridge start
 ```
 
 ---
 
-## 🛠️ CLI Usage
+## CLI Usage
 
-`tg-bridge` includes a management CLI:
+tg-bridge includes a management and dispatch CLI:
 
 ```bash
 # Service management
@@ -86,28 +95,33 @@ tg-bridge restart     # Restart the daemon
 tg-bridge status      # View daemon status
 tg-bridge logs        # Stream real-time logs (journalctl)
 
-# Outbound messaging
+# Outbound messaging (automatically detects agent and conversation title)
 tg-bridge send "Task finished! Here are the results..."
 tg-bridge send /path/to/screenshot.png "Visual review"
 cat report.md | tg-bridge send
+
+# Explicit agent or title overrides
+tg-bridge send --agent "Database Refactorer" --title "Schema Migration" "Migration completed."
+tg-bridge send --no-header "Raw message without header tag"
 ```
 
 ---
 
-## 🔄 Agentic Workflow Integration
+## Multi-Agent Workflow Integration
 
-When pairing with Google Antigravity, add the following instruction to your `AGENTS.md` or `GEMINI.md`:
+When pairing with Google Antigravity, add the following instruction to your AGENTS.md or GEMINI.md:
 
 ```markdown
-## Telegram Bridge Service (`tg-bridge`)
+## Telegram Bridge Service (tg-bridge)
 
 When the user requests Telegram updates or when running headless/remote tasks:
-- **Send update**: `tg-bridge send "<message>"`
-- **Send image**: `tg-bridge send /path/to/image.png "<caption optional>"`
-- Responses generated for the user should be mirrored to Telegram via `tg-bridge send`.
+- Send update: tg-bridge send "<message>"
+- Send image: tg-bridge send /path/to/image.png "<caption optional>"
+- Outbound messages automatically identify the active conversation title and agent name.
+- When the user replies to a specific update in Telegram, input is routed directly to this session.
 ```
 
 ---
 
-## 📄 License
+## License
 MIT License. Created for pairing Antigravity with Telegram.

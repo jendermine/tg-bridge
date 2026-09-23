@@ -8,14 +8,85 @@ import urllib.request
 import urllib.parse
 import json
 import time
+import argparse
+import sqlite3
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 CRED_PATH = os.path.expanduser('~/Documents/tg.txt')
-SESSION_PATH = os.path.expanduser('~/.local/share/tg-bridge/active_session.json')
+BASE_DIR = os.path.expanduser('~/.local/share/tg-bridge')
+SESSION_PATH = os.path.join(BASE_DIR, 'active_session.json')
+MESSAGE_MAP_PATH = os.path.join(BASE_DIR, 'message_map.json')
 
-def record_active_session():
+def load_credentials():
+    if not os.path.exists(CRED_PATH):
+        sys.stderr.write(f"Credentials file {CRED_PATH} not found.\n")
+        sys.exit(1)
+    with open(CRED_PATH, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    token = lines[0]
+    user_id = None
+    for line in lines[1:]:
+        if 'id:' in line:
+            user_id = int(line.split('id:')[1].strip())
+            break
+    if not user_id:
+        sys.stderr.write("User ID not found in credentials file.\n")
+        sys.exit(1)
+    return token, user_id
+
+def get_agy_conv_info(pid, cwd=None):
+    """Extract conversation ID and title from agy open file descriptors and summaries db."""
+    conv_id = None
+    title = None
+    agent = None
+
+    if pid:
+        fd_dir = f'/proc/{pid}/fd'
+        if os.path.exists(fd_dir):
+            for entry in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, entry))
+                    if '/conversations/' in target and target.endswith('.db'):
+                        conv_id = os.path.basename(target).replace('.db', '')
+                        break
+                except Exception:
+                    continue
+
+    if conv_id:
+        db_path = os.path.expanduser('~/.gemini/antigravity-cli/conversation_summaries.db')
+        if os.path.exists(db_path):
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute('SELECT title, agent_name FROM conversation_summaries WHERE conversation_id = ?', (conv_id,))
+                row = cur.fetchone()
+                if row:
+                    t, a = row
+                    if t:
+                        title = t.strip()
+                    if a:
+                        agent = a.strip()
+                conn.close()
+            except Exception:
+                pass
+
+    if not title:
+        title = os.path.basename(cwd) if cwd else 'Antigravity'
+    if not agent:
+        agent = 'Antigravity'
+
+    return {'conv_id': conv_id, 'title': title, 'agent': agent}
+
+def record_active_session(agent_override=None, title_override=None):
     """Identify the agy session running this command and save to active_session.json."""
+    if not psutil:
+        return {}
+
     try:
-        import psutil
         p = psutil.Process(os.getpid())
         agy_proc = None
         terminal = None
@@ -48,40 +119,64 @@ def record_active_session():
                 except Exception:
                     pass
 
+        cwd = agy_proc.cwd() if (agy_proc and hasattr(agy_proc, 'cwd')) else os.getcwd()
+        conv_info = get_agy_conv_info(agy_proc.pid if agy_proc else None, cwd)
+
+        if agent_override:
+            conv_info['agent'] = agent_override
+        if title_override:
+            conv_info['title'] = title_override
+
         session_data = {
             "agy_pid": agy_proc.pid if agy_proc else None,
             "terminal": terminal,
             "emulator_name": emulator_proc.name() if emulator_proc else None,
             "emulator_pid": emulator_proc.pid if emulator_proc else None,
-            "cwd": agy_proc.cwd() if (agy_proc and hasattr(agy_proc, 'cwd')) else os.getcwd(),
-            "updated_at": time.time()
+            "cwd": cwd,
+            "conv_id": conv_info.get('conv_id'),
+            "title": conv_info.get('title'),
+            "agent": conv_info.get('agent'),
+            "timestamp": time.time()
         }
         os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
         with open(SESSION_PATH, 'w') as f:
             json.dump(session_data, f, indent=2)
+
+        return session_data
     except Exception as e:
         sys.stderr.write(f"Warning: could not record active session: {e}\n")
+        return {}
 
-def load_credentials():
-    if not os.path.exists(CRED_PATH):
-        sys.stderr.write(f"Credentials file {CRED_PATH} not found.\n")
-        sys.exit(1)
-    with open(CRED_PATH, 'r') as f:
-        lines = [line.strip() for line in f if line.strip()]
-    token = lines[0]
-    user_id = None
-    for line in lines[1:]:
-        if 'id:' in line:
-            user_id = int(line.split('id:')[1].strip())
-            break
-    if not user_id:
-        sys.stderr.write("User ID not found in credentials file.\n")
-        sys.exit(1)
-    return token, user_id
+def save_message_mapping(msg_id, session_data):
+    """Store Telegram message ID to session mapping for reply tracking."""
+    if not msg_id or not session_data:
+        return
+    try:
+        data = {}
+        if os.path.exists(MESSAGE_MAP_PATH):
+            try:
+                with open(MESSAGE_MAP_PATH, 'r') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
 
-def send_photo(token, chat_id, photo_path, caption=""):
+        data[str(msg_id)] = session_data
+
+        # Keep map size bounded to most recent 300 entries
+        if len(data) > 300:
+            keys = sorted(data.keys(), key=lambda k: data[k].get('timestamp', 0))
+            for k in keys[:-300]:
+                del data[k]
+
+        os.makedirs(os.path.dirname(MESSAGE_MAP_PATH), exist_ok=True)
+        with open(MESSAGE_MAP_PATH, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not save message mapping: {e}\n")
+
+def send_photo(token, chat_id, photo_path, caption="", session_data=None):
     if not os.path.exists(photo_path):
-        return False
+        return None
     cmd = [
         'curl', '-s', '-X', 'POST',
         f'https://api.telegram.org/bot{token}/sendPhoto',
@@ -93,10 +188,15 @@ def send_photo(token, chat_id, photo_path, caption=""):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         data = json.loads(res.stdout)
-        return data.get('ok', False)
+        if data.get('ok'):
+            msg_id = data.get('result', {}).get('message_id')
+            if msg_id and session_data:
+                save_message_mapping(msg_id, session_data)
+            return msg_id
+        return None
     except Exception as e:
         sys.stderr.write(f"Telegram sendPhoto error: {e}\n")
-        return False
+        return None
 
 def markdown_to_tg_html(text: str):
     images = re.findall(r'!\[([^\]]*)\]\(([^)]+)\)', text)
@@ -137,7 +237,7 @@ def markdown_to_tg_html(text: str):
 
     return text, images
 
-def send_text_chunk(token, chat_id, text, parse_mode="HTML"):
+def send_text_chunk(token, chat_id, text, parse_mode="HTML", session_data=None):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {'chat_id': chat_id, 'text': text}
     if parse_mode:
@@ -147,64 +247,97 @@ def send_text_chunk(token, chat_id, text, parse_mode="HTML"):
     req = urllib.request.Request(url, data=data)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return True
+            resp_data = json.loads(resp.read().decode())
+            if resp_data.get('ok'):
+                msg_id = resp_data.get('result', {}).get('message_id')
+                if msg_id and session_data:
+                    save_message_mapping(msg_id, session_data)
+                return msg_id
+            return None
     except urllib.error.HTTPError as e:
         if parse_mode == "HTML":
             fallback_payload = {'chat_id': chat_id, 'text': re.sub(r'<[^>]+>', '', text)}
             fallback_data = urllib.parse.urlencode(fallback_payload).encode()
             fallback_req = urllib.request.Request(url, data=fallback_data)
             try:
-                with urllib.request.urlopen(fallback_req, timeout=15):
-                    return True
+                with urllib.request.urlopen(fallback_req, timeout=15) as fresp:
+                    fresp_data = json.loads(fresp.read().decode())
+                    if fresp_data.get('ok'):
+                        msg_id = fresp_data.get('result', {}).get('message_id')
+                        if msg_id and session_data:
+                            save_message_mapping(msg_id, session_data)
+                        return msg_id
             except Exception as fe:
                 sys.stderr.write(f"Telegram fallback send error: {fe}\n")
         sys.stderr.write(f"Telegram send error: {e}\n")
-        return False
+        return None
     except Exception as e:
         sys.stderr.write(f"Telegram send error: {e}\n")
-        return False
+        return None
 
 def main():
-    record_active_session()
-    if len(sys.argv) > 1:
-        first_arg = sys.argv[1]
-        if os.path.isfile(first_arg) and first_arg.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
-            token, chat_id = load_credentials()
-            caption = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
-            send_photo(token, chat_id, first_arg, caption=caption)
-            return
-        text = " ".join(sys.argv[1:])
-    else:
-        text = sys.stdin.read()
+    parser = argparse.ArgumentParser(description="Outbound sender for tg-bridge")
+    parser.add_argument('--agent', default=None, help="Agent name override")
+    parser.add_argument('--title', default=None, help="Conversation title override")
+    parser.add_argument('--no-header', action='store_true', help="Do not include agent/conversation header")
+    parser.add_argument('content', nargs='*', help="Message text or image file path")
 
-    if not text.strip():
-        return
+    args = parser.parse_args()
+
+    session_data = record_active_session(agent_override=args.agent, title_override=args.title)
+
+    agent_name = session_data.get('agent', 'Antigravity')
+    conv_title = session_data.get('title', 'Session')
 
     token, chat_id = load_credentials()
-    formatted, images = markdown_to_tg_html(text)
 
+    if args.content:
+        first_arg = args.content[0]
+        if os.path.isfile(first_arg) and first_arg.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+            caption_text = " ".join(args.content[1:]) if len(args.content) > 1 else ""
+            if not args.no_header:
+                prefix = f"[{agent_name} | {conv_title}] "
+                caption_text = prefix + caption_text if caption_text else prefix.strip()
+            send_photo(token, chat_id, first_arg, caption=caption_text, session_data=session_data)
+            return
+        raw_text = " ".join(args.content)
+    else:
+        raw_text = sys.stdin.read()
+
+    if not raw_text.strip():
+        return
+
+    formatted, images = markdown_to_tg_html(raw_text)
+
+    # Attach conversation header
+    if not args.no_header:
+        header = f"<b>[Agent: {html.escape(agent_name)} | {html.escape(conv_title)}]</b>\n\n"
+        formatted = header + formatted
+
+    # Send embedded images first
     for alt, img_path in images:
         clean_path = img_path.replace('file://', '')
         if os.path.exists(clean_path):
-            send_photo(token, chat_id, clean_path, caption=alt or "Image attachment")
+            img_caption = f"[{agent_name} | {conv_title}] {alt or 'Image attachment'}"
+            send_photo(token, chat_id, clean_path, caption=img_caption, session_data=session_data)
 
     max_len = 3800
     if len(formatted) <= max_len:
-        send_text_chunk(token, chat_id, formatted, parse_mode="HTML")
+        send_text_chunk(token, chat_id, formatted, parse_mode="HTML", session_data=session_data)
     else:
         lines = formatted.split("\n")
         current_chunk = []
         current_len = 0
         for line in lines:
             if current_len + len(line) + 1 > max_len:
-                send_text_chunk(token, chat_id, "\n".join(current_chunk), parse_mode="HTML")
+                send_text_chunk(token, chat_id, "\n".join(current_chunk), parse_mode="HTML", session_data=session_data)
                 current_chunk = [line]
                 current_len = len(line)
             else:
                 current_chunk.append(line)
                 current_len += len(line) + 1
         if current_chunk:
-            send_text_chunk(token, chat_id, "\n".join(current_chunk), parse_mode="HTML")
+            send_text_chunk(token, chat_id, "\n".join(current_chunk), parse_mode="HTML", session_data=session_data)
 
 if __name__ == '__main__':
     main()

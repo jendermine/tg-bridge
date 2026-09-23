@@ -1,8 +1,8 @@
-# Architecture: Antigravity Telegram Bridge (`tg-bridge`)
+# Architecture: Antigravity Telegram Bridge (tg-bridge)
 
-`tg-bridge` is a bidirectional, headless bridge linking an authorized Telegram user directly to their active **Google Antigravity (`agy`)** CLI development session on Linux (Wayland / GNOME).
+tg-bridge is a bidirectional, headless bridge linking an authorized Telegram user directly to their active Google Antigravity (agy) CLI development sessions on Linux (Wayland / GNOME).
 
-It allows mobile prompt submission, screenshot analysis, and bidirectional AI pairing with automated input staging, terminal window focusing, and command submission.
+It allows mobile prompt submission, screenshot analysis, and multi-agent coordination with automated input staging, terminal window focusing, and command submission.
 
 ---
 
@@ -27,16 +27,15 @@ flowchart TD
         subgraph LocalState["State & Storage (~/.local/share/tg-bridge/)"]
             Creds["~/Documents/tg.txt (Token & User ID)"]
             ActiveSession["active_session.json (PID, PTS, Emulator)"]
+            MessageMap["message_map.json (Message ID to Session Map)"]
             ImagesDir["images/ (Downloaded Media)"]
         end
 
         subgraph DesktopSession["User Desktop Session (Wayland)"]
             WLClipboard["Wayland Clipboard (wl-copy)"]
             ClipmanExt["Clipman GNOME Shell Extension (Clutter VK)"]
-            ActiveTerminal["Active Terminal (Contour / Ptyxis)"]
-            AgyCLI["Antigravity CLI (agy session)"]
-
-            ActiveTerminal --> AgyCLI
+            TermA["Terminal A (Agent 1: Builder)"]
+            TermB["Terminal B (Agent 2: Researcher)"]
         end
 
         subgraph OutboundCLI["Outbound CLI Controller"]
@@ -51,26 +50,30 @@ flowchart TD
     Creds -.->|Read Auth| ListenerDaemon
     Creds -.->|Read Auth| SenderScript
 
-    ListenerDaemon -->|1. Download Photos/Docs| ImagesDir
+    ListenerDaemon -->|1. Download Media| ImagesDir
     ListenerDaemon -->|2. Stage Prompt| WLClipboard
-    ListenerDaemon -->|3. Focus Window| ClipmanExt
-    ListenerDaemon -->|4. Paste (Ctrl+Shift+V)| ClipmanExt
-    ListenerDaemon -->|5. Submit (KEY_ENTER)| YDoToolService
-    YDoToolService -->|Synthesize Return| ActiveTerminal
-    ClipmanExt -->|Synthesize Paste| ActiveTerminal
+    ListenerDaemon -->|3. Query Reply Mapping| MessageMap
+    ListenerDaemon -->|4. Focus Target Terminal| ClipmanExt
+    ListenerDaemon -->|5. Paste Ctrl+Shift+V| ClipmanExt
+    ListenerDaemon -->|6. Submit KEY_ENTER| YDoToolService
+    YDoToolService -->|Synthesize Return| TermA
+    YDoToolService -->|Synthesize Return| TermB
+    ClipmanExt -->|Synthesize Paste| TermA
+    ClipmanExt -->|Synthesize Paste| TermB
 
     %% Outbound Connections
-    AgyCLI -->|Runs 'tg-bridge send'| TGCLI
+    TermA -->|tg-bridge send| TGCLI
+    TermB -->|tg-bridge send| TGCLI
     SenderScript -->|Trace caller process tree| ActiveSession
-    ActiveSession -.->|Read target session| ListenerDaemon
+    SenderScript -->|Save Message ID Mapping| MessageMap
     SenderScript -->|POST sendMessage / sendPhoto| BotAPI
 ```
 
 ---
 
-## 2. Inbound Message Pipeline (Telegram to `agy`)
+## 2. Inbound Message Pipeline & Multi-Agent Routing
 
-When the user sends a text prompt or screenshot from Telegram, the bridge automatically ingests the payload, resolves the target session, raises the terminal, pastes the prompt, and submits it.
+When the user sends a prompt from Telegram, the bridge determines whether it is a reply to an existing agent turn, focuses the respective window, and injects the turn.
 
 ```mermaid
 sequenceDiagram
@@ -78,17 +81,25 @@ sequenceDiagram
     actor User as Telegram User
     participant Bot as Telegram Bot API
     participant Listener as listener.py (Daemon)
+    participant MsgMap as message_map.json
     participant Clipboard as wl-copy (Wayland)
     participant Dbus as GNOME D-Bus
     participant Ydo as ydotool
-    participant Terminal as Terminal Window (agy)
+    participant Terminal as Target Terminal (agy)
 
-    User->>Bot: Send prompt or photo attachment
+    User->>Bot: Send prompt or photo (with optional reply_to)
     Listener->>Bot: Long-poll (getUpdates?timeout=30)
     Bot-->>Listener: Return incoming Update JSON
     Listener->>Listener: Verify sender ID == authorized_id
 
-    alt Payload is Image / Document
+    alt Has reply_to_message
+        Listener->>MsgMap: Query reply_to_message_id
+        MsgMap-->>Listener: Originating session (agy_pid, terminal, emulator_pid)
+    else No reply (fresh message)
+        Listener->>Listener: Fallback to active_session.json / process scan
+    end
+
+    alt Payload is Image or Document
         Listener->>Bot: Download file via getFile
         Bot-->>Listener: File bytes
         Listener->>Listener: Save to ~/.local/share/tg-bridge/images/
@@ -97,26 +108,25 @@ sequenceDiagram
         Listener->>Clipboard: wl-copy prompt text
     end
 
-    Listener->>Listener: Resolve target session from active_session.json / process scan
     Listener->>Dbus: ActivateWindowByPid(emulator_pid) / Ptyxis.Activate
-    Note over Terminal: Target terminal raised & focused on desktop
+    Note over Terminal: Target terminal raised and focused on desktop
 
     Listener->>Dbus: SimulatePaste("ctrl-shift-v")
-    Note over Terminal: Clutter Virtual Keyboard pastes clipboard into agy
+    Note over Terminal: Virtual Keyboard pastes clipboard into agy
     Listener->>Listener: Wait 150ms for bracketed paste buffering
 
     Listener->>Ydo: ydotool key -d 15 28:1 28:0 (KEY_ENTER)
     Note over Terminal: agy receives Enter keystroke and submits prompt!
 
-    Listener->>Bot: sendMessage reply: "✓ Pasted & submitted to Antigravity (PID ...)"
+    Listener->>Bot: sendMessage reply: "[Pasted and submitted to Agent (PID ...)]"
     Bot-->>User: Notification confirming automated submission
 ```
 
 ---
 
-## 3. Outbound Response Pipeline (`agy` to Telegram)
+## 3. Outbound Response Pipeline (agy to Telegram)
 
-When `agy` generates a response or needs to communicate with the user on Telegram, it invokes `tg-bridge send "<message>"`.
+When agy generates a response or needs to communicate with the user on Telegram, it invokes `tg-bridge send "<message>"`.
 
 ```mermaid
 sequenceDiagram
@@ -124,7 +134,8 @@ sequenceDiagram
     participant Agy as Antigravity (agy CLI)
     participant CLI as tg-bridge CLI
     participant Sender as sender.py
-    participant SessionFile as active_session.json
+    participant DB as conversation_summaries.db
+    participant MsgMap as message_map.json
     participant Bot as Telegram Bot API
     actor User as Telegram User
 
@@ -133,59 +144,69 @@ sequenceDiagram
 
     Sender->>Sender: Trace os.getpid() parent ancestry via psutil
     Note over Sender: Identifies: agy_pid, PTS terminal (/dev/pts/X),<br/>emulator_pid, emulator_name (contour/ptyxis), cwd
-    Sender->>SessionFile: Save active session metadata (JSON)
 
+    Sender->>DB: Query open conversation ID for title and agent name
+    DB-->>Sender: title="Refactor Auth", agent_name="Builder"
+
+    Sender->>Sender: Format header: [Agent: Builder | Refactor Auth]
     Sender->>Sender: markdown_to_tg_html (format headers, bold, code blocks)
-    Sender->>Sender: Extract embedded markdown images (![alt](path))
-    
-    loop Each embedded local image
-        Sender->>Bot: POST sendPhoto (multipart/form-data)
-    end
 
     alt Message <= 3800 chars
         Sender->>Bot: POST sendMessage (parse_mode=HTML)
+        Bot-->>Sender: Return {ok: true, result: {message_id: 1042}}
+        Sender->>MsgMap: Store 1042 -> session metadata
     else Message > 3800 chars
         loop Each chunk <= 3800 chars
             Sender->>Bot: POST sendMessage (chunk, parse_mode=HTML)
+            Bot-->>Sender: Return {ok: true, result: {message_id: chunk_id}}
+            Sender->>MsgMap: Store chunk_id -> session metadata
         end
     end
 
-    Bot-->>User: Delivered to Telegram chat
+    Bot-->>User: Delivered to Telegram chat with agent header
 ```
 
 ---
 
-## 4. Session Resolution Strategy
-
-When an incoming message arrives, `listener.py` needs to determine *which* `agy` session to paste into:
+## 4. Multi-Agent Session Resolution Decision Tree
 
 ```mermaid
 flowchart TD
-    Start([Incoming Telegram Message]) --> CheckSessionFile{Check active_session.json exists?}
+    Start([Incoming Telegram Message]) --> HasReply{Contains reply_to_message?}
     
-    CheckSessionFile -->|Yes| ValidatePID{Is agy_pid alive & running 'agy'?}
-    CheckSessionFile -->|No| ScanProcesses[Scan system processes with psutil]
+    HasReply -->|Yes| QueryMap[Lookup reply_to message_id in message_map.json]
+    QueryMap --> FoundInMap{Found in message_map?}
+    FoundInMap -->|Yes| CheckTargetAlive{Is target agy_pid alive?}
+    CheckTargetAlive -->|Yes| UseReplySession[Use mapped session: agy_pid, terminal, emulator_pid]
+    CheckTargetAlive -->|No| CheckActiveFile
+    FoundInMap -->|No| CheckActiveFile
 
-    ValidatePID -->|Alive| UseRecordedSession[Use recorded session: agy_pid, terminal, emulator_pid]
-    ValidatePID -->|Dead / Stale| ScanProcesses
+    HasReply -->|No| CheckActiveFile{Check active_session.json exists?}
+    
+    CheckActiveFile -->|Yes| ValidateActive{Is active agy_pid alive?}
+    CheckActiveFile -->|No| ScanProcesses[Scan system processes with psutil]
 
-    ScanProcesses --> FilterAgy[Filter processes matching 'agy' in name or cmdline]
+    ValidateActive -->|Alive| UseActiveSession[Use last active session]
+    ValidateActive -->|Dead / Stale| ScanProcesses
+
+    ScanProcesses --> FilterAgy[Filter processes matching agy in cmdline]
     FilterAgy --> FilterInteractive[Exclude subagents and non-interactive print mode]
     FilterInteractive --> HasCandidates{Found running interactive agy sessions?}
 
-    HasCandidates -->|Yes| SortCandidates[Sort by create_time descending: pick newest/active]
+    HasCandidates -->|Yes| SortCandidates[Sort by create_time descending: pick newest]
     HasCandidates -->|No| NoSession[No active session found: Fallback to clipboard only]
 
-    SortCandidates --> TraceAncestry[Trace parent tree to detect terminal device & emulator PID]
+    SortCandidates --> TraceAncestry[Trace parent tree to detect terminal device and emulator PID]
     TraceAncestry --> TargetResolved([Target Session Identified])
-    UseRecordedSession --> TargetResolved
+    UseReplySession --> TargetResolved
+    UseActiveSession --> TargetResolved
 ```
 
 ---
 
 ## 5. Wayland Virtual Input & Window Focusing
 
-GNOME Mutter on Wayland restricts arbitrary synthetic keypresses and window focus stealing for security. `tg-bridge` bypasses this reliably without requiring root privileges during operation:
+GNOME Mutter on Wayland restricts arbitrary synthetic keypresses and window focus stealing for security. tg-bridge bypasses this reliably without requiring root privileges during operation:
 
 ```mermaid
 flowchart LR

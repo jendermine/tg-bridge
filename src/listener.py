@@ -7,18 +7,76 @@ import urllib.request
 import urllib.parse
 import subprocess
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 CRED_PATH = os.path.expanduser('~/Documents/tg.txt')
 BASE_DIR = os.path.expanduser('~/.local/share/tg-bridge')
 IMAGES_DIR = os.path.join(BASE_DIR, 'images')
 SESSION_PATH = os.path.join(BASE_DIR, 'active_session.json')
+MESSAGE_MAP_PATH = os.path.join(BASE_DIR, 'message_map.json')
+
+def load_credentials():
+    if not os.path.exists(CRED_PATH):
+        sys.stderr.write(f"Credentials file {CRED_PATH} not found.\n")
+        sys.exit(1)
+    with open(CRED_PATH, 'r') as f:
+        lines = [line.strip() for line in f if line.strip()]
+    token = lines[0]
+    user_id = None
+    for line in lines[1:]:
+        if 'id:' in line:
+            user_id = int(line.split('id:')[1].strip())
+            break
+    if not user_id:
+        sys.stderr.write("User ID not found in credentials file.\n")
+        sys.exit(1)
+    return token, user_id
+
+def send_tg_reply(token, chat_id, text, reply_to_message_id=None):
+    sender_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sender.py')
+    if not os.path.exists(sender_script):
+        sender_script = os.path.join(BASE_DIR, 'sender.py')
+
+    if os.path.exists(sender_script):
+        cmd = ['python3', sender_script, '--no-header', text]
+        subprocess.run(cmd, check=False)
+    else:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+        if reply_to_message_id:
+            payload['reply_to_message_id'] = reply_to_message_id
+        data = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(url, data=data)
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except Exception:
+            pass
+
+def resolve_session_from_reply(reply_msg_id):
+    """Lookup originating session for the replied Telegram message ID."""
+    if not os.path.exists(MESSAGE_MAP_PATH):
+        return None
+    try:
+        with open(MESSAGE_MAP_PATH, 'r') as f:
+            data = json.load(f)
+        session = data.get(str(reply_msg_id))
+        if session:
+            pid = session.get('agy_pid')
+            if pid and psutil and psutil.pid_exists(pid):
+                proc = psutil.Process(pid)
+                cmd = " ".join(proc.cmdline()).lower()
+                if "agy" in proc.name().lower() or "agy" in cmd:
+                    return session
+    except Exception:
+        pass
+    return None
 
 def resolve_target_session():
     """Identify the active agy session communicating with tg-bridge or active on system."""
-    try:
-        import psutil
-    except ImportError:
-        psutil = None
-
     # 1. Check last recorded session from sender.py
     if os.path.exists(SESSION_PATH):
         try:
@@ -146,44 +204,13 @@ def inject_prompt_into_session(session=None, env=None):
     # Wait for the terminal to absorb the paste buffer
     time.sleep(0.15)
 
-    # 3. Simulate Enter (KEY_ENTER 28) to SUBMIT the prompt!
+    # 3. Simulate Enter (KEY_ENTER 28) to SUBMIT the prompt
     subprocess.run(
         ['ydotool', 'key', '-d', '15', '28:1', '28:0'],
         env=ydotool_env, capture_output=True, check=False
     )
 
     return session
-
-def load_credentials():
-    if not os.path.exists(CRED_PATH):
-        sys.stderr.write(f"Credentials file {CRED_PATH} not found.\n")
-        sys.exit(1)
-    with open(CRED_PATH, 'r') as f:
-        lines = [line.strip() for line in f if line.strip()]
-    token = lines[0]
-    user_id = None
-    for line in lines[1:]:
-        if 'id:' in line:
-            user_id = int(line.split('id:')[1].strip())
-            break
-    if not user_id:
-        sys.stderr.write("User ID not found in credentials file.\n")
-        sys.exit(1)
-    return token, user_id
-
-def send_tg_reply(token, chat_id, text):
-    sender_script = os.path.join(BASE_DIR, 'sender.py')
-    if os.path.exists(sender_script):
-        subprocess.run(['python3', sender_script, text], check=False)
-    else:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = urllib.parse.urlencode({'chat_id': chat_id, 'text': text}).encode()
-        req = urllib.request.Request(url, data=data)
-        try:
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except Exception:
-            pass
 
 def download_file(token, file_id, dest_folder):
     os.makedirs(dest_folder, exist_ok=True)
@@ -242,9 +269,21 @@ def main():
                     offset = update['update_id'] + 1
                     message = update.get('message', {})
                     from_id = message.get('from', {}).get('id')
+                    message_id = message.get('message_id')
 
                     if from_id != authorized_id:
                         continue
+
+                    # Check if this update is a reply to a previous message
+                    reply_to = message.get('reply_to_message')
+                    target_session = None
+
+                    if reply_to:
+                        reply_msg_id = reply_to.get('message_id')
+                        target_session = resolve_session_from_reply(reply_msg_id)
+
+                    if not target_session:
+                        target_session = resolve_target_session()
 
                     # 1. Photo
                     if 'photo' in message:
@@ -270,18 +309,22 @@ def main():
                                 '-a', 'tg-bridge'
                             ], env=env, check=False)
 
-                            session = inject_prompt_into_session(env=env)
+                            session = inject_prompt_into_session(session=target_session, env=env)
                             session_info = ""
                             if session and session.get('agy_pid'):
-                                term_info = session.get('terminal') or session.get('emulator_name') or 'session'
-                                session_info = f"\n✓ Pasted & submitted to Antigravity (PID <code>{session['agy_pid']}</code>, <code>{term_info}</code>)."
+                                agent_lbl = session.get('agent', 'Antigravity')
+                                title_lbl = session.get('title', '')
+                                term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
+                                target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
+                                session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
                             else:
-                                session_info = "\nStaged in clipboard. Press <b>Ctrl+Shift+V</b> in Antigravity to review."
+                                session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
 
                             send_tg_reply(
                                 token,
                                 from_id,
-                                f'Image received and saved to: <code>{local_img_path}</code>{session_info}'
+                                f'Image received and saved to: <code>{local_img_path}</code>{session_info}',
+                                reply_to_message_id=message_id
                             )
 
                     # 2. Document (Image)
@@ -304,18 +347,22 @@ def main():
                                 '-a', 'tg-bridge'
                             ], env=env, check=False)
 
-                            session = inject_prompt_into_session(env=env)
+                            session = inject_prompt_into_session(session=target_session, env=env)
                             session_info = ""
                             if session and session.get('agy_pid'):
-                                term_info = session.get('terminal') or session.get('emulator_name') or 'session'
-                                session_info = f"\n✓ Pasted & submitted to Antigravity (PID <code>{session['agy_pid']}</code>, <code>{term_info}</code>)."
+                                agent_lbl = session.get('agent', 'Antigravity')
+                                title_lbl = session.get('title', '')
+                                term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
+                                target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
+                                session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
                             else:
-                                session_info = "\nStaged in clipboard. Press <b>Ctrl+Shift+V</b> in Antigravity to review."
+                                session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
 
                             send_tg_reply(
                                 token,
                                 from_id,
-                                f'Image document received and saved to: <code>{local_img_path}</code>{session_info}'
+                                f'Image document received and saved to: <code>{local_img_path}</code>{session_info}',
+                                reply_to_message_id=message_id
                             )
 
                     # 3. Plain Text
@@ -331,18 +378,22 @@ def main():
                             '-a', 'tg-bridge'
                         ], env=env, check=False)
 
-                        session = inject_prompt_into_session(env=env)
+                        session = inject_prompt_into_session(session=target_session, env=env)
                         session_info = ""
                         if session and session.get('agy_pid'):
-                            term_info = session.get('terminal') or session.get('emulator_name') or 'session'
-                            session_info = f"\n✓ Pasted & submitted to Antigravity (PID <code>{session['agy_pid']}</code>, <code>{term_info}</code>)."
+                            agent_lbl = session.get('agent', 'Antigravity')
+                            title_lbl = session.get('title', '')
+                            term_lbl = session.get('terminal') or session.get('emulator_name') or 'session'
+                            target_desc = f"{agent_lbl} | {title_lbl}" if title_lbl else agent_lbl
+                            session_info = f"\n[Pasted and submitted to {target_desc} (PID {session['agy_pid']}, {term_lbl})]"
                         else:
-                            session_info = "\nStaged in clipboard. Press <b>Ctrl+Shift+V</b> in Antigravity to review."
+                            session_info = "\n[Staged in clipboard. Press Ctrl+Shift+V in Antigravity to review]"
 
                         send_tg_reply(
                             token,
                             from_id,
-                            f'Received: "<i>{text}</i>"{session_info}'
+                            f'Received: "<i>{text}</i>"{session_info}',
+                            reply_to_message_id=message_id
                         )
 
         except Exception as e:
