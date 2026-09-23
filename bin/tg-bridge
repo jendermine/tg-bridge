@@ -1,0 +1,60 @@
+#!/bin/bash
+# tg-bridge: Official CLI controller for the Antigravity Telegram Bridge
+set -e
+
+SERVICE_NAME="tg-bridge"
+
+# Resolve script directory (supporting symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+REPO_DIR="$( dirname "$SCRIPT_DIR" )"
+
+if [ -f "${REPO_DIR}/src/sender.py" ]; then
+    SENDER="${REPO_DIR}/src/sender.py"
+elif [ -f "${HOME}/.local/share/tg-bridge/sender.py" ]; then
+    SENDER="${HOME}/.local/share/tg-bridge/sender.py"
+else
+    SENDER="${SCRIPT_DIR}/sender.py"
+fi
+
+case "$1" in
+    start)
+        systemctl --user start "$SERVICE_NAME"
+        sleep 1
+        systemctl --user status "$SERVICE_NAME" --no-pager | head -n 8
+        ;;
+
+    stop)
+        systemctl --user stop "$SERVICE_NAME"
+        echo "tg-bridge stopped."
+        ;;
+
+    restart)
+        systemctl --user restart "$SERVICE_NAME"
+        sleep 1
+        systemctl --user status "$SERVICE_NAME" --no-pager | head -n 8
+        ;;
+
+    status)
+        systemctl --user status "$SERVICE_NAME" --no-pager
+        ;;
+
+    logs)
+        journalctl --user -u "$SERVICE_NAME" -f
+        ;;
+
+    send)
+        shift
+        python3 "$SENDER" "$@"
+        ;;
+
+    *)
+        echo "Usage: tg-bridge {start|stop|restart|status|logs|send <message/path>}"
+        exit 1
+        ;;
+esac
