@@ -91,11 +91,20 @@ Claude desktop app (or any agent session) is hung or closed:
 | Command | What it does |
 |---|---|
 | `/status` | Load, memory, heaviest processes, running builds/pushes |
-| `/stop` | Stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
+| `/stop` | Halts Claude (every Claude Code tool call is blocked by a hook until `/resume`) and stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
+| `/resume` | Lifts the halt |
 | `/killapp` | Force-quits a hung Claude desktop app |
 | `/ask [project] <message>` | Read-only help in `~/projects/<project>` (default `keyboardme`). Uses Claude Code (a fork of that project's latest conversation) if its CLI is signed in, otherwise Antigravity (`agy`) in plan mode. |
 | `/do [project] <message>` | Like `/ask`, but Antigravity may edit files and run commands in the project. |
 | `/help` | Lists the commands |
+
+The halt used by `/stop` is enforced by a Claude Code `PreToolUse` hook, so an agent cannot
+restart what was stopped. Add it once to `~/.claude/settings.json` (`install.sh` links the script):
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
+  { "type": "command", "command": "$HOME/.local/share/tg-bridge/halt-hook.sh" } ] } ] } }
+```
 
 ## CLI Usage
 

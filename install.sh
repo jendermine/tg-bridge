@@ -23,6 +23,7 @@ ln -sf "$SCRIPT_DIR/src/listener.py" "$SHARE_DIR/listener.py"
 ln -sf "$SCRIPT_DIR/src/sender.py" "$SHARE_DIR/sender.py"
 ln -sf "$SCRIPT_DIR/src/inbox.py" "$SHARE_DIR/inbox.py"
 ln -sf "$SCRIPT_DIR/src/hotline.py" "$SHARE_DIR/hotline.py"
+ln -sf "$SCRIPT_DIR/src/halt-hook.sh" "$SHARE_DIR/halt-hook.sh"
 chmod +x "$SHARE_DIR/listener.py" "$SHARE_DIR/sender.py" "$SHARE_DIR/inbox.py"
 
 # 4. Deploy systemd unit

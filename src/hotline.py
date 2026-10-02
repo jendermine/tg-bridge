@@ -6,8 +6,10 @@ closed, because the tg-bridge listener runs as its own systemd user service.
 Commands (only from the authorized user):
   /help                  list commands
   /status                memory, load, heaviest processes, builds/pushes running
-  /stop                  stop runaway work: Gradle daemons/builds, git push/pack,
-                         adb screenrecord (does not touch the desktop app)
+  /stop                  stop runaway work (Gradle, git push/pack, adb screenrecord)
+                         AND halt Claude: every Claude Code tool call is blocked until
+                         /resume, so nothing gets restarted
+  /resume                lift the halt so Claude can work again
   /killapp               force-quit a hung Claude desktop app
   /ask [project] <msg>   ask for help, read-only. Uses Claude Code (continuing a
                          fork of the project's latest conversation) when its CLI
@@ -31,7 +33,11 @@ ASK_TIMEOUT_S = 15 * 60
 TG_LIMIT = 3900
 
 AGY_BIN = os.path.expanduser('~/.local/bin/agy')
-COMMANDS = ('/help', '/status', '/stop', '/killapp', '/ask', '/do')
+COMMANDS = ('/help', '/status', '/stop', '/resume', '/killapp', '/ask', '/do')
+
+# While this file exists, a Claude Code PreToolUse hook (src/halt-hook.sh, installed in
+# ~/.claude/settings.json) blocks every tool call, so agents cannot restart what /stop killed.
+HALT_FILE = os.path.expanduser('~/.local/share/tg-bridge/HALT')
 
 # Context for Antigravity, which has none of the Claude conversation.
 _AGY_PREAMBLE = (
@@ -67,13 +73,14 @@ def _pre(text):
 
 # Process patterns considered "runaway work" for /stop.
 _STOP_PATTERNS = [
-    ('Gradle daemons', 'org.gradle.launcher.daemon'),
-    ('Gradle wrapper', 'org.gradle.wrapper.GradleWrapperMain'),
-    ('Kotlin daemons', 'KotlinCompileDaemon'),
-    ('git push', 'git.* push'),
-    ('git pack-objects', 'git pack-objects'),
-    ('git send-pack', 'git send-pack'),
-    ('adb screenrecord', 'screenrecord'),
+    # Patterns are matched against full command lines (pgrep -f) and anchored on the program
+    # itself, so shells or editors that merely mention these words are left alone.
+    ('Gradle daemons', 'java .*org\\.gradle\\.launcher\\.daemon\\.bootstrap\\.GradleDaemon'),
+    ('Gradle wrapper', 'java .*org\\.gradle\\.wrapper\\.GradleWrapperMain'),
+    ('Kotlin daemons', 'java .*KotlinCompileDaemon'),
+    ('git push', '^(/usr/bin/)?git( -[cC] [^ ]+)* push( |$)'),
+    ('git pack/send', '^/usr/libexec/git-core/git[ -](pack-objects|send-pack|remote-https)'),
+    ('adb screenrecord', '^(adb|/[^ ]*/adb) .*screenrecord|^screenrecord'),
 ]
 
 
@@ -99,12 +106,25 @@ def cmd_status():
             busy.append(f'{label}: {n}')
     lines.append('')
     lines.append('Running work: ' + (', '.join(busy) if busy else 'none'))
+    lines.append('Claude halted: ' + ('YES (send /resume)' if os.path.exists(HALT_FILE)
+                                       else 'no'))
     app = len(_pids('claude-desktop'))
     lines.append(f'Claude desktop processes: {app}')
     return _pre('\n'.join(lines))
 
 
+def cmd_resume():
+    if not os.path.exists(HALT_FILE):
+        return 'Claude was not halted.'
+    os.remove(HALT_FILE)
+    return 'Halt lifted. Claude can use its tools again.'
+
+
 def cmd_stop():
+    # Halt first, so nothing can be relaunched while we kill.
+    os.makedirs(os.path.dirname(HALT_FILE), exist_ok=True)
+    with open(HALT_FILE, 'w') as f:
+        f.write(time.strftime('%Y-%m-%d %H:%M:%S') + '\n')
     stopped = []
     for label, pattern in _STOP_PATTERNS:
         pids = _pids(pattern)
@@ -127,6 +147,7 @@ def cmd_stop():
     msg = 'Stopped: ' + (', '.join(stopped) if stopped else 'nothing was running')
     if killed:
         msg += f'\nForce-killed (ignored SIGTERM): {", ".join(killed)}'
+    msg += '\nClaude is HALTED: all its tool calls are blocked. Send /resume when ready.'
     return _escape(msg)
 
 
@@ -209,6 +230,8 @@ def handle(text, token, chat_id, reply_to, send):
         return cmd_status()
     if cmd == '/stop':
         return cmd_stop()
+    if cmd == '/resume':
+        return cmd_resume()
     if cmd == '/killapp':
         return cmd_killapp()
     if cmd == '/ask':
