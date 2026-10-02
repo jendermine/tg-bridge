@@ -9,10 +9,12 @@ Commands (only from the authorized user):
   /stop                  stop runaway work: Gradle daemons/builds, git push/pack,
                          adb screenrecord (does not touch the desktop app)
   /killapp               force-quit a hung Claude desktop app
-  /ask [project] <msg>   talk to Claude Code headlessly: continues (as a fork) the
-                         latest conversation of that project and replies here.
-                         project = a folder name under ~/projects (default
-                         keyboardme), e.g. "/ask tg-bridge why is X failing"
+  /ask [project] <msg>   ask for help, read-only. Uses Claude Code (continuing a
+                         fork of the project's latest conversation) when its CLI
+                         is signed in, otherwise Antigravity (agy) in plan mode.
+                         project = a folder under ~/projects (default keyboardme)
+  /do [project] <msg>    like /ask, but Antigravity may edit files and run
+                         commands in that project (accept-edits mode)
 """
 
 import os
@@ -28,7 +30,15 @@ CLAUDE_BIN = os.path.expanduser('~/.local/bin/claude')
 ASK_TIMEOUT_S = 15 * 60
 TG_LIMIT = 3900
 
-COMMANDS = ('/help', '/status', '/stop', '/killapp', '/ask')
+AGY_BIN = os.path.expanduser('~/.local/bin/agy')
+COMMANDS = ('/help', '/status', '/stop', '/killapp', '/ask', '/do')
+
+# Context for Antigravity, which has none of the Claude conversation.
+_AGY_PREAMBLE = (
+    "You are answering through an emergency Telegram hotline on jen's Linux PC, because the "
+    "Claude desktop app may be frozen or closed. Working directory: {cwd}. For context on "
+    "recent work, look at `git log --oneline -15` and `git status` there. Be brief: the reply "
+    "is read on a phone.\n\nMessage: ")
 
 
 def is_hotline(text):
@@ -133,25 +143,38 @@ def cmd_killapp():
             + (', force-killed' if left else '') + '). Reopen it when ready.')
 
 
-def _ask_worker(token, chat_id, reply_to, project, prompt, send):
-    cwd = os.path.join(PROJECTS_DIR, project)
-    cmd = [CLAUDE_BIN, '-c', '--fork-session', '-p', prompt]
-    started = time.time()
+def _run_agent(cmd, cwd):
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                              timeout=ASK_TIMEOUT_S,
                              env={**os.environ, 'TG_BRIDGE_HOTLINE': '1'})
-        text = (out.stdout or '').strip() or (out.stderr or '').strip() or '(no output)'
+        return (out.stdout or '').strip() or (out.stderr or '').strip() or '(no output)'
     except subprocess.TimeoutExpired:
-        text = f'(timed out after {ASK_TIMEOUT_S // 60} min)'
+        return f'(timed out after {ASK_TIMEOUT_S // 60} min)'
     except Exception as e:
-        text = f'(failed to run claude: {e})'
-    if 'Not logged in' in text:
-        text = ('The Claude Code CLI is not signed in, so /ask cannot reach Claude. '
-                'One-time fix on the PC: run `claude` in a terminal, type /login and sign in '
-                'with your Claude account. /status, /stop and /killapp work without it.')
+        return f'(failed to run {os.path.basename(cmd[0])}: {e})'
+
+
+def _ask_worker(token, chat_id, reply_to, project, prompt, send, allow_edits=False):
+    cwd = os.path.join(PROJECTS_DIR, project)
+    started = time.time()
+    text = None
+    who = 'Claude'
+    if not allow_edits and os.path.exists(CLAUDE_BIN):
+        text = _run_agent([CLAUDE_BIN, '-c', '--fork-session', '-p', prompt], cwd)
+        if 'Not logged in' in text or text.startswith('(failed'):
+            text = None
+    if text is None:
+        who = 'Antigravity' + (' (edits allowed)' if allow_edits else '')
+        if not os.path.exists(AGY_BIN):
+            text = 'Neither a signed-in Claude Code CLI nor agy is available.'
+        else:
+            text = _run_agent([AGY_BIN, '-p', _AGY_PREAMBLE.format(cwd=cwd) + prompt,
+                               '--mode', 'accept-edits' if allow_edits else 'plan',
+                               '--add-dir', cwd,
+                               '--print-timeout', f'{ASK_TIMEOUT_S - 30}s'], cwd)
     took = int(time.time() - started)
-    header = f'<b>Claude ({_escape(project)}, {took}s):</b>\n'
+    header = f'<b>{who} ({_escape(project)}, {took}s):</b>\n'
     body = _escape(text)
     chunks = [body[i:i + TG_LIMIT] for i in range(0, len(body), TG_LIMIT)] or ['']
     for i, chunk in enumerate(chunks):
@@ -159,7 +182,7 @@ def _ask_worker(token, chat_id, reply_to, project, prompt, send):
              reply_to_message_id=reply_to if i == 0 else None)
 
 
-def cmd_ask(args, token, chat_id, reply_to, send):
+def cmd_ask(args, token, chat_id, reply_to, send, allow_edits=False):
     parts = args.split(maxsplit=1)
     project = DEFAULT_PROJECT
     if parts and os.path.isdir(os.path.join(PROJECTS_DIR, parts[0])) and len(parts) > 1:
@@ -167,14 +190,13 @@ def cmd_ask(args, token, chat_id, reply_to, send):
     prompt = args.strip()
     if not prompt:
         return 'Usage: /ask [project] your message'
-    if not os.path.exists(CLAUDE_BIN):
-        return f'claude CLI not found at {CLAUDE_BIN}'
     threading.Thread(target=_ask_worker,
-                     args=(token, chat_id, reply_to, project, prompt, send),
+                     args=(token, chat_id, reply_to, project, prompt, send, allow_edits),
                      daemon=True).start()
-    return (f'Asking Claude in {_escape(project)} (continuing its latest conversation as a '
-            f'fork, headless; tools that need approval are not available). '
-            f'Reply comes here.')
+    if allow_edits:
+        return f'Working on it in {_escape(project)} (Antigravity, edits allowed). Reply comes here.'
+    return f'Looking into it in {_escape(project)} (read-only). Reply comes here.'
+
 
 
 def handle(text, token, chat_id, reply_to, send):
@@ -191,4 +213,6 @@ def handle(text, token, chat_id, reply_to, send):
         return cmd_killapp()
     if cmd == '/ask':
         return cmd_ask(rest, token, chat_id, reply_to, send)
+    if cmd == '/do':
+        return cmd_ask(rest, token, chat_id, reply_to, send, allow_edits=True)
     return None

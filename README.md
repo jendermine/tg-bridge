@@ -93,7 +93,8 @@ Claude desktop app (or any agent session) is hung or closed:
 | `/status` | Load, memory, heaviest processes, running builds/pushes |
 | `/stop` | Stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
 | `/killapp` | Force-quits a hung Claude desktop app |
-| `/ask [project] <message>` | Asks Claude Code headlessly in `~/projects/<project>` (default `keyboardme`), continuing that project's latest conversation as a fork; the answer is sent back here. Needs the `claude` CLI signed in once (`claude`, then `/login`). |
+| `/ask [project] <message>` | Read-only help in `~/projects/<project>` (default `keyboardme`). Uses Claude Code (a fork of that project's latest conversation) if its CLI is signed in, otherwise Antigravity (`agy`) in plan mode. |
+| `/do [project] <message>` | Like `/ask`, but Antigravity may edit files and run commands in the project. |
 | `/help` | Lists the commands |
 
 ## CLI Usage
