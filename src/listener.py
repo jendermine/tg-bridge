@@ -15,6 +15,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import inbox
+import hotline
 
 CRED_PATH = os.path.expanduser('~/Documents/tg.txt')
 BASE_DIR = os.path.expanduser('~/.local/share/tg-bridge')
@@ -519,6 +520,20 @@ def process_update(update, token, env):
     message = update.get('message', {})
     from_id = message.get('from', {}).get('id')
     message_id = message.get('message_id')
+
+    # Hotline commands are handled here, independent of any agent session, so they keep
+    # working when the Claude desktop app is hung or closed.
+    text = message.get('text') or ''
+    if hotline.is_hotline(text):
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Hotline: {text.split()[0]}")
+        sys.stdout.flush()
+        try:
+            reply = hotline.handle(text, token, from_id, message_id, send_tg_reply)
+        except Exception as e:
+            reply = f"Hotline error: {e}"
+        if reply:
+            send_tg_reply(token, from_id, reply, reply_to_message_id=message_id)
+        return 'hotline'
 
     route, target_session, message = resolve_route(message)
 

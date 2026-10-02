@@ -22,6 +22,7 @@ echo "==> Linking daemon scripts to $SHARE_DIR"
 ln -sf "$SCRIPT_DIR/src/listener.py" "$SHARE_DIR/listener.py"
 ln -sf "$SCRIPT_DIR/src/sender.py" "$SHARE_DIR/sender.py"
 ln -sf "$SCRIPT_DIR/src/inbox.py" "$SHARE_DIR/inbox.py"
+ln -sf "$SCRIPT_DIR/src/hotline.py" "$SHARE_DIR/hotline.py"
 chmod +x "$SHARE_DIR/listener.py" "$SHARE_DIR/sender.py" "$SHARE_DIR/inbox.py"
 
 # 4. Deploy systemd unit

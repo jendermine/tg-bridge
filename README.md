@@ -83,6 +83,19 @@ tg-bridge start
 
 ---
 
+## Emergency hotline
+
+The listener handles these Telegram commands itself, so they work even when the
+Claude desktop app (or any agent session) is hung or closed:
+
+| Command | What it does |
+|---|---|
+| `/status` | Load, memory, heaviest processes, running builds/pushes |
+| `/stop` | Stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
+| `/killapp` | Force-quits a hung Claude desktop app |
+| `/ask [project] <message>` | Asks Claude Code headlessly in `~/projects/<project>` (default `keyboardme`), continuing that project's latest conversation as a fork; the answer is sent back here. Needs the `claude` CLI signed in once (`claude`, then `/login`). |
+| `/help` | Lists the commands |
+
 ## CLI Usage
 
 tg-bridge includes a management and dispatch CLI:
