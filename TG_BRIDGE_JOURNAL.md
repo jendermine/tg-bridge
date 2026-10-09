@@ -1,1 +1,0 @@
-/home/jen/projects/tg-bridge/JOURNAL.md

@@ -42,3 +42,6 @@ credentials.json
 .vscode/
 *.swp
 *.swo
+
+# Local symlink to JOURNAL.md
+TG_BRIDGE_JOURNAL.md
