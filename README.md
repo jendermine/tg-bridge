@@ -1,21 +1,48 @@
-# tg-bridge: Antigravity Telegram Bridge
+# tg-bridge: Telegram Bridge for Coding Agents
 
-A headless bridge linking Telegram directly to active Google Antigravity (agy) CLI coding sessions on Linux (Wayland / GNOME).
+A headless bridge linking Telegram directly to active coding-agent sessions on Linux (Wayland / GNOME): terminal CLI agents and Claude Code.
 
-Send prompts, code snippets, and image attachments from Telegram. The bridge automatically identifies the target session, brings the terminal window to focus, pastes the input (Ctrl+Shift+V), and presses Enter to submit the turn automatically.
+Send prompts, code snippets and image attachments from Telegram. The bridge automatically identifies the target session, brings the terminal window to focus, pastes the input (Ctrl+Shift+V) and presses Enter to submit the turn automatically.
 
 When running multiple agents across different workspaces or terminals, replying directly to an agent's message on Telegram routes your response exclusively to that specific agent session.
+
+---
+
+## Emergency hotline
+
+The listener handles these Telegram commands itself, so they work even when the
+Claude desktop app (or any agent session) is hung or closed:
+
+| Command | What it does |
+|---|---|
+| `/status` | Load, memory, heaviest processes, running builds/pushes |
+| `/stop` | Halts Claude (every Claude Code tool call is blocked by a hook until `/resume`) and stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
+| `/resume` | Lifts the halt |
+| `/killapp` | Force-quits a hung Claude desktop app |
+| `/ask [project] <message>` | Read-only help in `~/projects/<project>` (default `keyboardme`). Uses Claude Code (a fork of that project's latest conversation) if its CLI is signed in, otherwise the terminal agent CLI in plan mode. |
+| `/do [project] <message>` | Like `/ask`, but the terminal agent may edit files and run commands in the project. |
+| `/help` | Lists the commands |
+
+The halt used by `/stop` is enforced by a Claude Code `PreToolUse` hook, so an agent cannot
+restart what was stopped. Add it once to `~/.claude/settings.json` (`install.sh` links the script):
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
+  { "type": "command", "command": "$HOME/.local/share/tg-bridge/halt-hook.sh" } ] } ] } }
+```
 
 ---
 
 ## Features
 
 - Multi-Agent Routing: Every outbound message tags the originating agent name and conversation title, recording the Telegram message ID. Replying to a message on Telegram routes your prompt directly to that specific agent session.
-- Automated Session Discovery: Dynamically tracks which agy session is actively communicating. Falls back to the most recently active session when messages are not replies.
+- Automated Session Discovery: Dynamically tracks which terminal agent session is actively communicating. Falls back to the most recently active session when messages are not replies.
 - Wayland Window Focus and Input Injection: Natively raises the target terminal window on GNOME Wayland and simulates Ctrl+Shift+V followed by KEY_ENTER via kernel uinput (ydotool).
 - Image and Screenshot Support: Photos and image documents sent via Telegram are downloaded to ~/.local/share/tg-bridge/images/ and automatically formatted as [Image: /path/to/image] in the input prompt.
 - Rich Outbound Formatting: Translates Markdown (headers, bold, italics, code blocks) into Telegram HTML and splits oversized outputs into chunks.
 - Desktop Notifications: Provides immediate desktop feedback using notify-send with thumbnail previews.
+- Claude Code Sessions: Claude Code has no terminal to paste into, so replies to its messages are queued in a per-session inbox it reads with `tg-bridge inbox`. Kept fully separate from terminal agents (see below).
+- Status Reports: `tg-bridge report` sends a bold title and one `Label: value` line per argument, so progress updates look the same every time.
 
 ---
 
@@ -33,17 +60,17 @@ flowchart LR
         Listener["listener.py (Daemon)"]
         Sender["sender.py (CLI)"]
         YDoTool["ydotool (uinput)"]
-        Agy["agy (Antigravity CLI)"]
+        Agent["Terminal agent CLI"]
 
         Bot -->|getUpdates / replies| Listener
-        Listener -->|Focus + Paste + Enter| Agy
-        Agy -->|tg-bridge send| Sender
+        Listener -->|Focus + Paste + Enter| Agent
+        Agent -->|tg-bridge send| Sender
         Sender -->|sendMessage / sendPhoto| Bot
-        YDoTool -.->|Simulate Enter| Agy
+        YDoTool -.->|Simulate Enter| Agent
     end
 ```
 
-For complete sequence diagrams, reply-routing flows, and internal design, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For complete sequence diagrams, reply-routing flows and internal design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
@@ -55,12 +82,15 @@ For complete sequence diagrams, reply-routing flows, and internal design, see [A
 - wl-clipboard (wl-copy)
 - ydotool (configured with systemd service and uinput access)
 
+Tested on Fedora 44 Workstation (GNOME Shell 50.5, Wayland), kernel 7.2.9, Python 3.14.8.
+
 ### 2. Setup Credentials
-Create ~/Documents/tg.txt containing your Telegram Bot Token on line 1 and your authorized user ID on line 2:
+Create ~/Documents/tg.txt containing your Telegram Bot Token on line 1 and your authorized user ID on a later line prefixed with `id:`:
 ```text
 1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
 id: 987654321
 ```
+The values above are placeholders. The file lives outside the repo and is the only place the token and ID are read from; `tg.txt`, `*.token`, `*.key` and `credentials.json` are also in `.gitignore`.
 
 ### 3. Installation
 Clone the repository and run the installer:
@@ -82,29 +112,6 @@ tg-bridge start
 ```
 
 ---
-
-## Emergency hotline
-
-The listener handles these Telegram commands itself, so they work even when the
-Claude desktop app (or any agent session) is hung or closed:
-
-| Command | What it does |
-|---|---|
-| `/status` | Load, memory, heaviest processes, running builds/pushes |
-| `/stop` | Halts Claude (every Claude Code tool call is blocked by a hook until `/resume`) and stops runaway work: Gradle/Kotlin daemons, git push/pack-objects, adb screenrecord |
-| `/resume` | Lifts the halt |
-| `/killapp` | Force-quits a hung Claude desktop app |
-| `/ask [project] <message>` | Read-only help in `~/projects/<project>` (default `keyboardme`). Uses Claude Code (a fork of that project's latest conversation) if its CLI is signed in, otherwise Antigravity (`agy`) in plan mode. |
-| `/do [project] <message>` | Like `/ask`, but Antigravity may edit files and run commands in the project. |
-| `/help` | Lists the commands |
-
-The halt used by `/stop` is enforced by a Claude Code `PreToolUse` hook, so an agent cannot
-restart what was stopped. Add it once to `~/.claude/settings.json` (`install.sh` links the script):
-
-```json
-{ "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
-  { "type": "command", "command": "$HOME/.local/share/tg-bridge/halt-hook.sh" } ] } ] } }
-```
 
 ## CLI Usage
 
@@ -149,32 +156,30 @@ Claude Code runs as a `claude` process spawned by the Claude desktop app, with n
 - Exit codes: 0 ok, 2 not called from a Claude Code session, 3 `--wait` timed out.
 - Fresh message to Claude: start it with `/claude ` (the prefix is stripped). It goes to the most recently active live Claude Code session.
 
-### Separation rules (agy and Claude Code never interfere)
+### Separation rules (terminal agents and Claude Code never interfere)
 
-- `active_session.json` is agy-only. Claude Code sessions are recorded in `active_session_claude.json`. `message_map.json` entries carry `"kind": "agy"` or `"kind": "claude"`; entries without `kind` are agy.
-- Fresh (non-reply) messages always follow the agy behaviour (active agy session, else newest agy process), even if Claude Code sent last. Only `/claude ` messages go to Claude Code; if no Claude Code session is alive the message is acked as not delivered and nothing else happens.
-- Replies to an agy message go to agy exactly as before.
-- Replies to a Claude Code message go to that session's inbox. If that session has ended, the reply is acked as not delivered and is never sent to agy.
-- Claude Code routing never touches agy's input path: no clipboard (`wl-copy`), no window focus, no paste, no `ydotool`. Only `notify-send` is used.
+- `active_session.json` is for terminal agents only. Claude Code sessions are recorded in `active_session_claude.json`. `message_map.json` entries carry `"kind": "agy"` or `"kind": "claude"`; entries without `kind` are terminal agent entries.
+- Fresh (non-reply) messages always follow the terminal agent behaviour (active session, else newest agent process), even if Claude Code sent last. Only `/claude ` messages go to Claude Code; if no Claude Code session is alive the message is acked as not delivered and nothing else happens.
+- Replies to a terminal agent message go to that agent exactly as before.
+- Replies to a Claude Code message go to that session's inbox. If that session has ended, the reply is acked as not delivered and is never sent to a terminal agent.
+- Claude Code routing never touches the terminal agent input path: no clipboard (`wl-copy`), no window focus, no paste, no `ydotool`. Only `notify-send` is used.
 - Listener acks call `sender.py --no-record`, so they never write `active_session.json` or `message_map.json`.
 
 ---
 
 ## Multi-Agent Workflow Integration
 
-When pairing with Google Antigravity, add the following instruction to your AGENTS.md or GEMINI.md:
+Add this to your agent instructions (CLAUDE.md, AGENTS.md):
 
 ```markdown
 ## Telegram Bridge Service (tg-bridge)
 
-When the user requests Telegram updates or when running headless/remote tasks:
-- Send update: tg-bridge send "<message>"
-- Send image: tg-bridge send /path/to/image.png "<caption optional>"
-- Outbound messages automatically identify the active conversation title and agent name.
-- When the user replies to a specific update in Telegram, input is routed directly to this session.
+- Progress update: tg-bridge report "<title>" "Stage=..." "Errors=..." "ETA=..." (no emojis)
+- Free-form message or image: tg-bridge send "<message>" / tg-bridge send /path/to/image.png "<caption>"
+- Replies to your messages are queued, read them with tg-bridge inbox (--wait to block for one).
 ```
 
 ---
 
 ## License
-MIT License. Created for pairing Antigravity with Telegram.
+MIT License. Created for pairing coding agents with Telegram.
