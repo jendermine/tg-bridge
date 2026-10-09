@@ -54,6 +54,25 @@ case "$1" in
         python3 "$SENDER" "$@"
         ;;
 
+    report)
+        shift
+        if [ -z "$1" ]; then
+            echo "Usage: tg-bridge report <title> [Label=value | line]..."
+            exit 1
+        fi
+        # Bold title, blank line, then one "Label: value" (or plain) line per argument
+        MSG="**$1**"$'\n'
+        shift
+        for ITEM in "$@"; do
+            if [[ "$ITEM" == *=* ]]; then
+                MSG+=$'\n'"${ITEM%%=*}: ${ITEM#*=}"
+            else
+                MSG+=$'\n'"$ITEM"
+            fi
+        done
+        python3 "$SENDER" "$MSG"
+        ;;
+
     inbox)
         shift
         # Exit codes: 0 ok, 2 not in a Claude Code session, 3 --wait timed out
@@ -63,7 +82,7 @@ case "$1" in
         ;;
 
     *)
-        echo "Usage: tg-bridge {start|stop|restart|status|logs|send <message/path>|inbox [--wait [SECONDS]] [--peek]}"
+        echo "Usage: tg-bridge {start|stop|restart|status|logs|send <message/path>|report <title> [Label=value]...|inbox [--wait [SECONDS]] [--peek]}"
         exit 1
         ;;
 esac

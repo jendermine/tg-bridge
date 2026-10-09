@@ -128,6 +128,9 @@ tg-bridge send --agent "Database Refactorer" --title "Schema Migration" "Migrati
 tg-bridge send --no-header "Raw message without header tag"
 tg-bridge send --no-record "Send without recording a session or message mapping"
 
+# Status report: bold title, then one "Label: value" line per argument
+tg-bridge report "Build status" "Stage=compile 99%" "Errors=none" "ETA=21:30 UTC"
+
 # Claude Code sessions only
 tg-bridge inbox                 # print queued replies for this session and mark them read
 tg-bridge inbox --peek          # print without marking read
